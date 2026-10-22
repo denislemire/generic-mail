@@ -10,6 +10,46 @@ import (
 	"github.com/emersion/go-imap/v2"
 )
 
+func TestForEachCallbackCanReadBody(t *testing.T) {
+	ctx := context.Background()
+	store := blob.NewMem()
+	raw := []byte("From: a@example.com\r\nTo: denis@generic.business\r\nSubject: hello\r\nDate: Tue, 21 Oct 2026 12:00:00 +0000\r\n\r\nbody\r\n")
+	store.PutMeta("inbound/one", raw, time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC))
+
+	eng, err := New(ctx, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.SyncInbound(ctx, "inbound/"); err != nil {
+		t.Fatal(err)
+	}
+	box, err := eng.Open("INBOX")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		var set imap.SeqSet
+		set.AddNum(1)
+		box.ForEach(set, func(m Msg) {
+			got, err := eng.Body(ctx, m.Key)
+			if err != nil {
+				t.Errorf("body: %v", err)
+			}
+			if string(got) != string(raw) {
+				t.Errorf("body mismatch")
+			}
+			close(done)
+		})
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ForEach callback blocked on the mailbox lock")
+	}
+}
+
 func TestSyncAssignsStableUID(t *testing.T) {
 	ctx := context.Background()
 	store := blob.NewMem()

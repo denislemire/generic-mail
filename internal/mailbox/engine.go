@@ -643,18 +643,19 @@ type Msg struct {
 	Flags    []imap.Flag
 }
 
-// ForEach calls fn for each selected message. numSet is resolved under the lock.
+// ForEach calls fn for each selected message. The mailbox lock is released
+// before fn runs, so fn may call Body without deadlocking.
 func (b *Box) ForEach(numSet imap.NumSet, fn func(Msg)) {
 	b.e.mu.Lock()
-	defer b.e.mu.Unlock()
 	bx := b.box()
 	numSet = staticNumSet(numSet, bx)
+	matched := make([]Msg, 0)
 	for i, m := range bx.msgs {
 		seq := uint32(i + 1)
 		if !contains(numSet, seq, m.uid) {
 			continue
 		}
-		fn(Msg{
+		matched = append(matched, Msg{
 			Seq:      seq,
 			UID:      m.uid,
 			Key:      m.key,
@@ -662,6 +663,10 @@ func (b *Box) ForEach(numSet imap.NumSet, fn func(Msg)) {
 			Internal: m.internal,
 			Flags:    flagList(m.flags),
 		})
+	}
+	b.e.mu.Unlock()
+	for _, msg := range matched {
+		fn(msg)
 	}
 }
 
