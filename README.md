@@ -8,6 +8,8 @@ Message bodies are cached in the process (64 MiB). The first fetch reads the buc
 
 SMTP is AUTH PLAIN after TLS. Ports are IMAPS 993, submission 587, and SMTPS 465. The AWS SDK uses its default credential chain, including a projected service-account token when `AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE` are set.
 
+When `OAUTH_JWKS_URL` is set, IMAP and submission also advertise `XOAUTH2` and `OAUTHBEARER`. The initial response is the one Roundcube sends: the SASL username is an allowed identity, and `auth=` is an RS256 access token (a `Bearer ` prefix is optional). The token issuer, audience, and either `preferred_username` or `email` must match `OAUTH_ISSUER`, `OAUTH_AUDIENCE`, and `OAUTH_ALLOWED`. Password login is unchanged.
+
 Required environment: `MAIL_USERNAME`, `MAIL_PASSWORD`, `MAIL_HOSTNAME`, `S3_BUCKET`. `MAIL_DATA` is the writable directory for the SQLite index and local message files.
 
 The chart defaults are generic. A cluster sets the bucket, hostname, role, and image in its own values.

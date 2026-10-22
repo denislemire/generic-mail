@@ -17,6 +17,14 @@ mailbox:
 
 existingSecret: generic-mail
 
+# When jwksURL is set, IMAP and SMTP also accept XOAUTH2 and OAUTHBEARER.
+# Password LOGIN and AUTH PLAIN stay available for mail clients.
+oauth:
+  issuer: ""
+  jwksURL: ""
+  audience: ""
+  allowed: []
+
 persistence:
   enabled: true
   size: 10Gi
