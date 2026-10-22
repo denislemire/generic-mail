@@ -9,7 +9,7 @@ spec:
   entryPoints:
     - {{ .Values.tcp.imapsEntryPoint }}
   routes:
-    - match: HostSNI(`{{ .Values.mailbox.hostname }}`)
+    - match: HostSNI(`{{ .Values.mailbox.imapHostname | default .Values.mailbox.hostname }}`)
       services:
         - name: {{ include "generic-mail.fullname" . }}
           port: {{ .Values.service.imaps }}
@@ -26,7 +26,7 @@ spec:
   entryPoints:
     - {{ .Values.tcp.smtpsEntryPoint }}
   routes:
-    - match: HostSNI(`{{ .Values.mailbox.hostname }}`)
+    - match: HostSNI(`{{ .Values.mailbox.smtpHostname | default .Values.mailbox.hostname }}`)
       services:
         - name: {{ include "generic-mail.fullname" . }}
           port: {{ .Values.service.smtps }}

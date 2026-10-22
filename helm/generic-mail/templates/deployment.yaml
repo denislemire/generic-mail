@@ -37,7 +37,7 @@ spec:
               containerPort: {{ .Values.service.health }}
           env:
             - name: MAIL_HOSTNAME
-              value: {{ .Values.mailbox.hostname | quote }}
+              value: {{ .Values.mailbox.smtpHostname | default .Values.mailbox.hostname | quote }}
             - name: MAIL_USERNAME
               valueFrom:
                 secretKeyRef:
