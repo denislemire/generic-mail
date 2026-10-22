@@ -11,5 +11,9 @@ spec:
     name: {{ .Values.tls.issuer }}
     kind: ClusterIssuer
   dnsNames:
-    - {{ .Values.mailbox.hostname }}
+    {{- $imap := .Values.mailbox.imapHostname | default .Values.mailbox.hostname }}
+    {{- $smtp := .Values.mailbox.smtpHostname | default .Values.mailbox.hostname }}
+    {{- range list $imap $smtp | uniq }}
+    - {{ . }}
+    {{- end }}
 {{- end }}
