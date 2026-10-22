@@ -9,6 +9,8 @@ import (
 	"net/mail"
 	"strings"
 
+	"github.com/denislemire/generic-mail/internal/oauth"
+
 	"github.com/emersion/go-sasl"
 	"github.com/emersion/go-smtp"
 )
@@ -20,12 +22,13 @@ type Sender interface {
 
 // Server is an authenticated submission listener that relays to Sender.
 type Server struct {
-	Hostname string
-	Username string
-	Password string
+	Hostname  string
+	Username  string
+	Password  string
 	AllowFrom []string
-	Sender   Sender
-	MaxBytes int64
+	Sender    Sender
+	MaxBytes  int64
+	OAuth     *oauth.Checker
 }
 
 func (s *Server) NewSession(*smtp.Conn) (smtp.Session, error) {
@@ -56,21 +59,40 @@ type session struct {
 	rcpts  []string
 }
 
-func (s *session) AuthMechanisms() []string { return []string{sasl.Plain} }
+func (s *session) AuthMechanisms() []string {
+	mechs := []string{sasl.Plain}
+	if s.srv.OAuth.Enabled() {
+		mechs = append(mechs, oauth.XOAuth2, sasl.OAuthBearer)
+	}
+	return mechs
+}
 
 func (s *session) Auth(mech string) (sasl.Server, error) {
-	if mech != sasl.Plain {
+	switch strings.ToUpper(mech) {
+	case sasl.Plain:
+		return sasl.NewPlainServer(func(_, username, password string) error {
+			userOK := subtle.ConstantTimeCompare([]byte(strings.ToLower(username)), []byte(strings.ToLower(s.srv.Username))) == 1
+			passOK := len(password) == len(s.srv.Password) && subtle.ConstantTimeCompare([]byte(password), []byte(s.srv.Password)) == 1
+			if !userOK || !passOK {
+				return smtp.ErrAuthFailed
+			}
+			s.authed = true
+			return nil
+		}), nil
+	case oauth.XOAuth2, sasl.OAuthBearer:
+		if !s.srv.OAuth.Enabled() {
+			return nil, smtp.ErrAuthUnknownMechanism
+		}
+		return oauth.NewServer(func(username, token string) error {
+			if err := s.srv.OAuth.Accept(username, token); err != nil {
+				return smtp.ErrAuthFailed
+			}
+			s.authed = true
+			return nil
+		}), nil
+	default:
 		return nil, smtp.ErrAuthUnknownMechanism
 	}
-	return sasl.NewPlainServer(func(_, username, password string) error {
-		userOK := subtle.ConstantTimeCompare([]byte(strings.ToLower(username)), []byte(strings.ToLower(s.srv.Username))) == 1
-		passOK := len(password) == len(s.srv.Password) && subtle.ConstantTimeCompare([]byte(password), []byte(s.srv.Password)) == 1
-		if !userOK || !passOK {
-			return smtp.ErrAuthFailed
-		}
-		s.authed = true
-		return nil
-	}), nil
 }
 
 func (s *session) Reset() {

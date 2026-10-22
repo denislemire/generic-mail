@@ -48,6 +48,16 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.existingSecret }}
                   key: password
+            {{- if .Values.oauth.jwksURL }}
+            - name: OAUTH_ISSUER
+              value: {{ .Values.oauth.issuer | quote }}
+            - name: OAUTH_JWKS_URL
+              value: {{ .Values.oauth.jwksURL | quote }}
+            - name: OAUTH_AUDIENCE
+              value: {{ .Values.oauth.audience | quote }}
+            - name: OAUTH_ALLOWED
+              value: {{ join "," .Values.oauth.allowed | quote }}
+            {{- end }}
             - name: AWS_ROLE_ARN
               value: {{ .Values.aws.roleArn | quote }}
             - name: AWS_WEB_IDENTITY_TOKEN_FILE

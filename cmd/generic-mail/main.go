@@ -8,12 +8,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/denislemire/generic-mail/internal/blob"
 	"github.com/denislemire/generic-mail/internal/imapd"
 	"github.com/denislemire/generic-mail/internal/mailbox"
+	"github.com/denislemire/generic-mail/internal/oauth"
 	"github.com/denislemire/generic-mail/internal/sesmail"
 	"github.com/denislemire/generic-mail/internal/smtpd"
 
@@ -51,6 +53,15 @@ func main() {
 	if err != nil {
 		log.Fatalf("ses: %v", err)
 	}
+	checker, err := oauth.New(oauth.Config{
+		Issuer:   os.Getenv("OAUTH_ISSUER"),
+		JWKSURL:  os.Getenv("OAUTH_JWKS_URL"),
+		Audience: os.Getenv("OAUTH_AUDIENCE"),
+		Allowed:  strings.Split(os.Getenv("OAUTH_ALLOWED"), ","),
+	})
+	if err != nil {
+		log.Fatalf("oauth: %v", err)
+	}
 
 	cert, err := tls.LoadX509KeyPair(env("TLS_CERT", "/tls/tls.crt"), env("TLS_KEY", "/tls/tls.key"))
 	if err != nil {
@@ -60,7 +71,7 @@ func main() {
 
 	imapSrv := imapserver.New(&imapserver.Options{
 		NewSession: func(*imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
-			return (&imapd.Server{Engine: engine, Username: username, Password: password}).NewSession(), &imapserver.GreetingData{}, nil
+			return (&imapd.Server{Engine: engine, Username: username, Password: password, OAuth: checker}).NewSession(), &imapserver.GreetingData{}, nil
 		},
 		TLSConfig:    tlsConfig,
 		InsecureAuth: false,
@@ -70,6 +81,7 @@ func main() {
 		Username: username,
 		Password: password,
 		Sender:   sesClient,
+		OAuth:    checker,
 	}
 
 	errCh := make(chan error, 4)

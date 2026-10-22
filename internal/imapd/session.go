@@ -8,10 +8,12 @@ import (
 	"strings"
 
 	"github.com/denislemire/generic-mail/internal/mailbox"
+	"github.com/denislemire/generic-mail/internal/oauth"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/emersion/go-message/textproto"
+	"github.com/emersion/go-sasl"
 )
 
 // Server serves one mailbox over IMAP.
@@ -19,6 +21,7 @@ type Server struct {
 	Engine   *mailbox.Engine
 	Username string
 	Password string
+	OAuth    *oauth.Checker
 }
 
 func (s *Server) NewSession() imapserver.Session {
@@ -54,6 +57,39 @@ func (s *session) Login(username, password string) error {
 	}
 	s.authed = true
 	return nil
+}
+
+func (s *session) AuthenticateMechanisms() []string {
+	mechs := []string{sasl.Plain}
+	if s.srv.OAuth.Enabled() {
+		mechs = append(mechs, oauth.XOAuth2, sasl.OAuthBearer)
+	}
+	return mechs
+}
+
+func (s *session) Authenticate(mech string) (sasl.Server, error) {
+	switch strings.ToUpper(mech) {
+	case sasl.Plain:
+		return sasl.NewPlainServer(func(identity, username, password string) error {
+			if identity != "" && !strings.EqualFold(identity, username) {
+				return imapserver.ErrAuthFailed
+			}
+			return s.Login(username, password)
+		}), nil
+	case oauth.XOAuth2, sasl.OAuthBearer:
+		if !s.srv.OAuth.Enabled() {
+			return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "SASL mechanism not supported"}
+		}
+		return oauth.NewServer(func(username, token string) error {
+			if err := s.srv.OAuth.Accept(username, token); err != nil {
+				return imapserver.ErrAuthFailed
+			}
+			s.authed = true
+			return nil
+		}), nil
+	default:
+		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "SASL mechanism not supported"}
+	}
 }
 
 func (s *session) needAuth() error {
