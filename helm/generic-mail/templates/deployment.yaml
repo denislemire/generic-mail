@@ -1,0 +1,110 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "generic-mail.fullname" . }}
+  labels:
+    {{- include "generic-mail.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "generic-mail.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "generic-mail.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "generic-mail.fullname" . }}
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: generic-mail
+          image: {{ include "generic-mail.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: imaps
+              containerPort: {{ .Values.service.imaps }}
+            - name: submission
+              containerPort: {{ .Values.service.submission }}
+            - name: smtps
+              containerPort: {{ .Values.service.smtps }}
+            - name: health
+              containerPort: {{ .Values.service.health }}
+          env:
+            - name: MAIL_HOSTNAME
+              value: {{ .Values.mailbox.hostname | quote }}
+            - name: MAIL_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret }}
+                  key: username
+            - name: MAIL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret }}
+                  key: password
+            - name: AWS_ROLE_ARN
+              value: {{ .Values.aws.roleArn | quote }}
+            - name: AWS_WEB_IDENTITY_TOKEN_FILE
+              value: /var/run/secrets/aws/token
+            - name: AWS_REGION
+              value: {{ .Values.mailbox.s3Region | quote }}
+            - name: S3_BUCKET
+              value: {{ .Values.mailbox.bucket | quote }}
+            - name: S3_INBOUND_PREFIX
+              value: {{ .Values.mailbox.inboundPrefix | quote }}
+            - name: S3_REGION
+              value: {{ .Values.mailbox.s3Region | quote }}
+            - name: SES_REGION
+              value: {{ .Values.mailbox.sesRegion | quote }}
+            - name: SYNC_INTERVAL
+              value: {{ .Values.mailbox.syncInterval | quote }}
+            - name: TLS_CERT
+              value: /tls/tls.crt
+            - name: TLS_KEY
+              value: /tls/tls.key
+            - name: LISTEN_IMAPS
+              value: {{ printf ":%v" .Values.service.imaps | quote }}
+            - name: LISTEN_SUBMISSION
+              value: {{ printf ":%v" .Values.service.submission | quote }}
+            - name: LISTEN_SMTPS
+              value: {{ printf ":%v" .Values.service.smtps | quote }}
+            - name: LISTEN_HEALTH
+              value: {{ printf ":%v" .Values.service.health | quote }}
+          volumeMounts:
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+            - name: aws-web-identity
+              mountPath: /var/run/secrets/aws
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.secretName }}
+        - name: aws-web-identity
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: {{ .Values.aws.audience | quote }}
+                  expirationSeconds: 3600
+                  path: token

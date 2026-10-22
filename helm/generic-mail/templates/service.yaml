@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "generic-mail.fullname" . }}
+  labels:
+    {{- include "generic-mail.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "generic-mail.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: imaps
+      port: {{ .Values.service.imaps }}
+      targetPort: imaps
+    - name: submission
+      port: {{ .Values.service.submission }}
+      targetPort: submission
+    - name: smtps
+      port: {{ .Values.service.smtps }}
+      targetPort: smtps
+    - name: health
+      port: {{ .Values.service.health }}
+      targetPort: health

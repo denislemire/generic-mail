@@ -1,0 +1,63 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/denislemire/generic-mail
+  tag: ""
+  pullPolicy: IfNotPresent
+
+mailbox:
+  hostname: ""
+  bucket: ""
+  inboundPrefix: inbound/
+  s3Region: us-east-1
+  sesRegion: us-east-1
+  syncInterval: 30s
+
+existingSecret: generic-mail
+
+# Projected service-account token. AWS_ROLE_ARN + AWS_WEB_IDENTITY_TOKEN_FILE.
+aws:
+  roleArn: ""
+  audience: sts.amazonaws.com
+
+service:
+  imaps: 993
+  submission: 587
+  smtps: 465
+  health: 8080
+
+tls:
+  enabled: true
+  issuer: letsencrypt
+  secretName: generic-mail-tls
+
+tcp:
+  enabled: true
+  imapsEntryPoint: imaps
+  submissionEntryPoint: submission
+  smtpsEntryPoint: smtps
+
+networkPolicy:
+  enabled: true
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: "1"
+    memory: 256Mi

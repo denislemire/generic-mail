@@ -1,0 +1,16 @@
+apiVersion: v2
+name: generic-mail
+description: IMAP mailbox over an object store, with authenticated SMTP submission
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - imap
+  - smtp
+  - ses
+home: https://github.com/denislemire/generic-mail
+sources:
+  - https://github.com/denislemire/generic-mail
+maintainers:
+  - name: Denis Lemire
+    url: https://github.com/denislemire

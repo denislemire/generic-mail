@@ -1,0 +1,9 @@
+Interim Generic mailbox.
+
+Thunderbird, on the LAN or VPN:
+
+- IMAP: {{ .Values.mailbox.hostname }} port {{ .Values.service.imaps }}, SSL/TLS, normal password
+- SMTP: {{ .Values.mailbox.hostname }} port {{ .Values.service.smtps }}, SSL/TLS, normal password
+- Username is the mailbox address in the Generic mail secret
+
+Inbound mail stays in the SES bucket. This pod only reads it. Port 587 is STARTTLS submission. Port 25 is not used.

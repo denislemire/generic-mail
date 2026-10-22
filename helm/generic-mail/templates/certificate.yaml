@@ -1,0 +1,15 @@
+{{- if .Values.tls.enabled }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "generic-mail.fullname" . }}
+  labels:
+    {{- include "generic-mail.labels" . | nindent 4 }}
+spec:
+  secretName: {{ .Values.tls.secretName }}
+  issuerRef:
+    name: {{ .Values.tls.issuer }}
+    kind: ClusterIssuer
+  dnsNames:
+    - {{ .Values.mailbox.hostname }}
+{{- end }}

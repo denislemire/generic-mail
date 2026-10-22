@@ -1,0 +1,377 @@
+package imapd
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/subtle"
+	"strings"
+
+	"github.com/denislemire/generic-mail/internal/mailbox"
+
+	"github.com/emersion/go-imap/v2"
+	"github.com/emersion/go-imap/v2/imapserver"
+	"github.com/emersion/go-message/textproto"
+)
+
+// Server serves one mailbox over IMAP.
+type Server struct {
+	Engine   *mailbox.Engine
+	Username string
+	Password string
+}
+
+func (s *Server) NewSession() imapserver.Session {
+	return &session{srv: s}
+}
+
+type session struct {
+	srv      *Server
+	authed   bool
+	box      *mailbox.Box
+	view     *imapserver.SessionTracker
+	readOnly bool
+}
+
+func (s *session) Close() error {
+	s.dropView()
+	return nil
+}
+
+func (s *session) dropView() {
+	if s.view != nil {
+		s.view.Close()
+		s.view = nil
+	}
+	s.box = nil
+}
+
+func (s *session) Login(username, password string) error {
+	userOK := subtle.ConstantTimeCompare([]byte(strings.ToLower(username)), []byte(strings.ToLower(s.srv.Username))) == 1
+	passOK := len(password) == len(s.srv.Password) && subtle.ConstantTimeCompare([]byte(password), []byte(s.srv.Password)) == 1
+	if !userOK || !passOK {
+		return imapserver.ErrAuthFailed
+	}
+	s.authed = true
+	return nil
+}
+
+func (s *session) needAuth() error {
+	if !s.authed {
+		return no("authenticate first")
+	}
+	return nil
+}
+
+func (s *session) Select(name string, options *imap.SelectOptions) (*imap.SelectData, error) {
+	if err := s.needAuth(); err != nil {
+		return nil, err
+	}
+	box, err := s.srv.Engine.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	s.dropView()
+	s.box = box
+	s.view = box.Tracker().NewSession()
+	s.readOnly = options != nil && options.ReadOnly
+	return box.SelectData(), nil
+}
+
+func (s *session) Unselect() error {
+	s.dropView()
+	s.readOnly = false
+	return nil
+}
+
+func (s *session) Create(string, *imap.CreateOptions) error {
+	return no("this mailbox has INBOX, Sent, Drafts, and Trash")
+}
+
+func (s *session) Delete(string) error { return no("mailboxes are fixed") }
+
+func (s *session) Rename(string, string, *imap.RenameOptions) error {
+	return no("mailboxes are fixed")
+}
+
+func (s *session) Subscribe(name string) error   { return s.setSub(name, true) }
+func (s *session) Unsubscribe(name string) error { return s.setSub(name, false) }
+
+func (s *session) setSub(name string, on bool) error {
+	if err := s.needAuth(); err != nil {
+		return err
+	}
+	box, err := s.srv.Engine.Open(name)
+	if err != nil {
+		return err
+	}
+	return box.SetSubscribed(context.Background(), on)
+}
+
+func (s *session) List(w *imapserver.ListWriter, ref string, patterns []string, options *imap.ListOptions) error {
+	if err := s.needAuth(); err != nil {
+		return err
+	}
+	if options == nil {
+		options = &imap.ListOptions{}
+	}
+	for _, data := range s.srv.Engine.ListData(options.SelectSubscribed, options.SelectSpecialUse, options.ReturnSpecialUse) {
+		if !matchList(data.Mailbox, ref, patterns) {
+			continue
+		}
+		item := data
+		if err := w.WriteList(&item); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *session) Status(name string, options *imap.StatusOptions) (*imap.StatusData, error) {
+	if err := s.needAuth(); err != nil {
+		return nil, err
+	}
+	box, err := s.srv.Engine.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	return box.StatusData(options), nil
+}
+
+func (s *session) Append(name string, r imap.LiteralReader, options *imap.AppendOptions) (*imap.AppendData, error) {
+	if err := s.needAuth(); err != nil {
+		return nil, err
+	}
+	box, err := s.srv.Engine.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	return box.Append(context.Background(), r, options)
+}
+
+func (s *session) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error {
+	if s.view == nil {
+		return nil
+	}
+	return s.view.Poll(w, allowExpunge)
+}
+
+func (s *session) Idle(w *imapserver.UpdateWriter, stop <-chan struct{}) error {
+	if s.view == nil {
+		return no("select a mailbox before IDLE")
+	}
+	return s.view.Idle(w, stop)
+}
+
+func (s *session) Expunge(w *imapserver.ExpungeWriter, uids *imap.UIDSet) error {
+	if err := s.selected(); err != nil {
+		return err
+	}
+	if s.readOnly {
+		return no("mailbox is read-only")
+	}
+	_ = w
+	return s.box.Expunge(context.Background(), uids)
+}
+
+func (s *session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria, options *imap.SearchOptions) (*imap.SearchData, error) {
+	if err := s.selected(); err != nil {
+		return nil, err
+	}
+	_ = options
+	var data imap.SearchData
+	var seqSet imap.SeqSet
+	var uidSet imap.UIDSet
+	for _, msg := range s.box.Messages() {
+		raw, err := s.srv.Engine.Body(context.Background(), msg.Key)
+		if err != nil {
+			return nil, err
+		}
+		if !mailbox.Match(msg, raw, msg.Seq, criteria) {
+			continue
+		}
+		uidSet.AddNum(msg.UID)
+		var num uint32
+		switch kind {
+		case imapserver.NumKindSeq:
+			seqSet.AddNum(msg.Seq)
+			num = msg.Seq
+		default:
+			num = uint32(msg.UID)
+		}
+		if data.Min == 0 || num < data.Min {
+			data.Min = num
+		}
+		if data.Max == 0 || num > data.Max {
+			data.Max = num
+		}
+		data.Count++
+	}
+	switch kind {
+	case imapserver.NumKindSeq:
+		data.All = seqSet
+	default:
+		data.All = uidSet
+	}
+	return &data, nil
+}
+
+func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *imap.FetchOptions) error {
+	if err := s.selected(); err != nil {
+		return err
+	}
+	if options == nil {
+		options = &imap.FetchOptions{}
+	}
+	var seen []imap.UID
+	markSeen := false
+	for _, section := range options.BodySection {
+		if !section.Peek {
+			markSeen = true
+			break
+		}
+	}
+	var fetchErr error
+	s.box.ForEach(numSet, func(msg mailbox.Msg) {
+		if fetchErr != nil {
+			return
+		}
+		raw, err := s.srv.Engine.Body(context.Background(), msg.Key)
+		if err != nil {
+			fetchErr = err
+			return
+		}
+		if markSeen && !s.readOnly {
+			seen = append(seen, msg.UID)
+		}
+		seq := msg.Seq
+		if s.view != nil {
+			if encoded := s.view.EncodeSeqNum(seq); encoded != 0 {
+				seq = encoded
+			}
+		}
+		mw := w.CreateMessage(seq)
+		fetchErr = writeFetch(mw, msg, raw, options)
+	})
+	if fetchErr != nil {
+		return fetchErr
+	}
+	if len(seen) > 0 {
+		s.box.SetSeen(seen)
+		return s.srv.Engine.Commit(context.Background())
+	}
+	return nil
+}
+
+func (s *session) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *imap.StoreFlags, options *imap.StoreOptions) error {
+	if err := s.selected(); err != nil {
+		return err
+	}
+	if s.readOnly {
+		return no("mailbox is read-only")
+	}
+	_ = options
+	changed := s.box.Store(numSet, flags.Op, flags.Flags, s.view)
+	if err := s.srv.Engine.Commit(context.Background()); err != nil {
+		return err
+	}
+	if flags.Silent {
+		return nil
+	}
+	for _, msg := range changed {
+		raw, err := s.srv.Engine.Body(context.Background(), msg.Key)
+		if err != nil {
+			return err
+		}
+		seq := msg.Seq
+		if s.view != nil {
+			if encoded := s.view.EncodeSeqNum(seq); encoded != 0 {
+				seq = encoded
+			}
+		}
+		mw := w.CreateMessage(seq)
+		if err := writeFetch(mw, msg, raw, &imap.FetchOptions{Flags: true}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *session) Copy(numSet imap.NumSet, dest string) (*imap.CopyData, error) {
+	if err := s.selected(); err != nil {
+		return nil, err
+	}
+	if s.readOnly {
+		return nil, no("mailbox is read-only")
+	}
+	return s.box.Copy(context.Background(), numSet, dest)
+}
+
+func (s *session) selected() error {
+	if err := s.needAuth(); err != nil {
+		return err
+	}
+	if s.box == nil {
+		return no("select a mailbox")
+	}
+	return nil
+}
+
+func matchList(name, ref string, patterns []string) bool {
+	if len(patterns) == 0 {
+		return true
+	}
+	full := name
+	if ref != "" && !strings.EqualFold(ref, "INBOX") {
+		full = strings.TrimRight(ref, "/") + "/" + name
+	}
+	for _, pattern := range patterns {
+		if pattern == "*" || pattern == "%" || strings.EqualFold(pattern, full) || strings.EqualFold(pattern, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func no(text string) error {
+	err := imap.Error(imap.StatusResponse{Type: imap.StatusResponseTypeNo, Text: text})
+	return &err
+}
+
+func writeFetch(w *imapserver.FetchResponseWriter, msg mailbox.Msg, raw []byte, options *imap.FetchOptions) error {
+	w.WriteUID(msg.UID)
+	if options.Flags {
+		w.WriteFlags(msg.Flags)
+	}
+	if options.InternalDate {
+		w.WriteInternalDate(msg.Internal)
+	}
+	if options.RFC822Size {
+		w.WriteRFC822Size(int64(len(raw)))
+	}
+	if options.Envelope {
+		br := bufio.NewReader(bytes.NewReader(raw))
+		hdr, err := textproto.ReadHeader(br)
+		if err != nil {
+			w.WriteEnvelope(&imap.Envelope{})
+		} else {
+			w.WriteEnvelope(imapserver.ExtractEnvelope(hdr))
+		}
+	}
+	if options.BodyStructure != nil {
+		w.WriteBodyStructure(imapserver.ExtractBodyStructure(bytes.NewReader(raw)))
+	}
+	for _, section := range options.BodySection {
+		buf := imapserver.ExtractBodySection(bytes.NewReader(raw), section)
+		wc := w.WriteBodySection(section, int64(len(buf)))
+		_, writeErr := wc.Write(buf)
+		closeErr := wc.Close()
+		if writeErr != nil {
+			return writeErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+	}
+	return w.Close()
+}

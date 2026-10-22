@@ -1,0 +1,74 @@
+# CircleCI Server — build and push the image and chart to Zot.
+#
+# Machine executor: KubeVirt linux.medium (ubuntu-2404).
+# Registry auth: onepassword/secrets orb + ehws-1password-secrets context.
+version: 2.1
+
+orbs:
+  onepassword: onepassword/secrets@1
+
+jobs:
+  build-push:
+    machine:
+      image: ubuntu-2404:current
+    resource_class: medium
+    environment:
+      ZOT_USERNAME: op://EhWS Secrets/Registry EHWS - Zot htpasswd/username
+      ZOT_PASSWORD: op://EhWS Secrets/Registry EHWS - Zot htpasswd/password
+    steps:
+      - checkout
+      - run:
+          name: Test
+          command: |
+            set -euo pipefail
+            docker run --rm \
+              -v "$PWD":/src \
+              -w /src \
+              -e GOFLAGS=-mod=readonly \
+              golang:1.27-alpine \
+              go test ./...
+      - run:
+          name: Install unzip and helm
+          command: |
+            set -euo pipefail
+            sudo apt-get update
+            sudo apt-get install -y unzip
+            curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      - onepassword/install-cli:
+          version: "2.34.1"
+          path: /usr/local/bin
+      - run:
+          name: Verify op CLI
+          command: |
+            set -euo pipefail
+            command -v op
+            op --version
+            echo 'export PATH="/usr/local/bin:$PATH"' >> "$BASH_ENV"
+      - run:
+          name: Push image and chart to Zot
+          no_output_timeout: 30m
+          shell: op run -- /bin/bash
+          command: |
+            set -euo pipefail
+            REGISTRY="registry.ehws.generic.business"
+            VERSION="$(tr -d '[:space:]' < VERSION)"
+            CHART_VERSION="$(awk '/^version:/ {print $2}' helm/generic-mail/Chart.yaml)"
+            IMAGE="${REGISTRY}/ehws/generic-mail"
+            SHA="sha-${CIRCLE_SHA1:0:7}"
+            printf '%s' "${ZOT_PASSWORD}" | docker login "${REGISTRY}" -u "${ZOT_USERNAME}" --password-stdin
+            docker build --progress=plain -t "${IMAGE}:${VERSION}" -t "${IMAGE}:${SHA}" .
+            docker push "${IMAGE}:${VERSION}"
+            docker push "${IMAGE}:${SHA}"
+            printf '%s' "${ZOT_PASSWORD}" | helm registry login "${REGISTRY}" -u "${ZOT_USERNAME}" --password-stdin
+            mkdir -p /tmp/charts
+            helm package helm/generic-mail --destination /tmp/charts
+            helm push "/tmp/charts/generic-mail-${CHART_VERSION}.tgz" "oci://${REGISTRY}/ehws"
+
+workflows:
+  build:
+    jobs:
+      - build-push:
+          context: ehws-1password-secrets
+          filters:
+            branches:
+              only: main

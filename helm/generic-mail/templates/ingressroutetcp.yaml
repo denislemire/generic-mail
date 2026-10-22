@@ -1,0 +1,50 @@
+{{- if .Values.tcp.enabled }}
+apiVersion: traefik.io/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: {{ include "generic-mail.fullname" . }}-imaps
+  labels:
+    {{- include "generic-mail.labels" . | nindent 4 }}
+spec:
+  entryPoints:
+    - {{ .Values.tcp.imapsEntryPoint }}
+  routes:
+    - match: HostSNI(`{{ .Values.mailbox.hostname }}`)
+      services:
+        - name: {{ include "generic-mail.fullname" . }}
+          port: {{ .Values.service.imaps }}
+  tls:
+    passthrough: true
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: {{ include "generic-mail.fullname" . }}-smtps
+  labels:
+    {{- include "generic-mail.labels" . | nindent 4 }}
+spec:
+  entryPoints:
+    - {{ .Values.tcp.smtpsEntryPoint }}
+  routes:
+    - match: HostSNI(`{{ .Values.mailbox.hostname }}`)
+      services:
+        - name: {{ include "generic-mail.fullname" . }}
+          port: {{ .Values.service.smtps }}
+  tls:
+    passthrough: true
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: {{ include "generic-mail.fullname" . }}-submission
+  labels:
+    {{- include "generic-mail.labels" . | nindent 4 }}
+spec:
+  entryPoints:
+    - {{ .Values.tcp.submissionEntryPoint }}
+  routes:
+    - match: HostSNI(`*`)
+      services:
+        - name: {{ include "generic-mail.fullname" . }}
+          port: {{ .Values.service.submission }}
+{{- end }}
