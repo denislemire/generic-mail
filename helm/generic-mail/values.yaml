@@ -12,10 +12,16 @@ mailbox:
   bucket: ""
   inboundPrefix: inbound/
   s3Region: us-east-1
-  sesRegion: us-east-1
+  sesRegion: ca-central-1
   syncInterval: 30s
 
 existingSecret: generic-mail
+
+persistence:
+  enabled: true
+  size: 10Gi
+  storageClass: ""
+  mountPath: /var/lib/generic-mail
 
 # Projected service-account token. AWS_ROLE_ARN + AWS_WEB_IDENTITY_TOKEN_FILE.
 aws:
@@ -46,6 +52,7 @@ podSecurityContext:
   runAsNonRoot: true
   runAsUser: 65532
   runAsGroup: 65532
+  fsGroup: 65532
   seccompProfile:
     type: RuntimeDefault
 
