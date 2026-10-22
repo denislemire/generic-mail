@@ -84,14 +84,25 @@ func (s *session) Unselect() error {
 	return nil
 }
 
-func (s *session) Create(string, *imap.CreateOptions) error {
-	return no("this mailbox has INBOX, Sent, Drafts, and Trash")
+func (s *session) Create(name string, _ *imap.CreateOptions) error {
+	if err := s.needAuth(); err != nil {
+		return err
+	}
+	return s.srv.Engine.Create(context.Background(), name)
 }
 
-func (s *session) Delete(string) error { return no("mailboxes are fixed") }
+func (s *session) Delete(name string) error {
+	if err := s.needAuth(); err != nil {
+		return err
+	}
+	return s.srv.Engine.Delete(context.Background(), name)
+}
 
-func (s *session) Rename(string, string, *imap.RenameOptions) error {
-	return no("mailboxes are fixed")
+func (s *session) Rename(from, to string, _ *imap.RenameOptions) error {
+	if err := s.needAuth(); err != nil {
+		return err
+	}
+	return s.srv.Engine.Rename(context.Background(), from, to)
 }
 
 func (s *session) Subscribe(name string) error   { return s.setSub(name, true) }
@@ -183,7 +194,7 @@ func (s *session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria,
 	var seqSet imap.SeqSet
 	var uidSet imap.UIDSet
 	for _, msg := range s.box.Messages() {
-		raw, err := s.srv.Engine.Body(context.Background(), msg.Key)
+		raw, err := s.srv.Engine.Body(context.Background(), msg.Loc, msg.Key)
 		if err != nil {
 			return nil, err
 		}
@@ -236,7 +247,7 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 		if fetchErr != nil {
 			return
 		}
-		raw, err := s.srv.Engine.Body(context.Background(), msg.Key)
+		raw, err := s.srv.Engine.Body(context.Background(), msg.Loc, msg.Key)
 		if err != nil {
 			fetchErr = err
 			return
@@ -279,7 +290,7 @@ func (s *session) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *im
 		return nil
 	}
 	for _, msg := range changed {
-		raw, err := s.srv.Engine.Body(context.Background(), msg.Key)
+		raw, err := s.srv.Engine.Body(context.Background(), msg.Loc, msg.Key)
 		if err != nil {
 			return err
 		}

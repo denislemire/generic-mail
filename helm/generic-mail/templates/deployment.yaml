@@ -62,6 +62,10 @@ spec:
               value: {{ .Values.mailbox.s3Region | quote }}
             - name: SES_REGION
               value: {{ .Values.mailbox.sesRegion | quote }}
+            {{- if .Values.persistence.enabled }}
+            - name: MAIL_DATA
+              value: {{ .Values.persistence.mountPath | quote }}
+            {{- end }}
             - name: SYNC_INTERVAL
               value: {{ .Values.mailbox.syncInterval | quote }}
             - name: TLS_CERT
@@ -83,6 +87,10 @@ spec:
             - name: aws-web-identity
               mountPath: /var/run/secrets/aws
               readOnly: true
+            {{- if .Values.persistence.enabled }}
+            - name: data
+              mountPath: {{ .Values.persistence.mountPath }}
+            {{- end }}
           readinessProbe:
             httpGet:
               path: /healthz
@@ -101,6 +109,11 @@ spec:
         - name: tls
           secret:
             secretName: {{ .Values.tls.secretName }}
+        {{- if .Values.persistence.enabled }}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "generic-mail.fullname" . }}
+        {{- end }}
         - name: aws-web-identity
           projected:
             sources:

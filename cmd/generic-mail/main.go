@@ -32,17 +32,18 @@ func main() {
 	}
 	prefix := env("S3_INBOUND_PREFIX", "inbound/")
 	s3Region := env("S3_REGION", "us-east-1")
-	sesRegion := env("SES_REGION", "us-east-1")
+	sesRegion := env("SES_REGION", "ca-central-1")
 	hostname := os.Getenv("MAIL_HOSTNAME")
 	if hostname == "" {
 		log.Fatal("MAIL_HOSTNAME is required")
 	}
+	dataDir := env("MAIL_DATA", "/var/lib/generic-mail")
 
 	store, err := blob.NewS3(ctx, bucket, s3Region)
 	if err != nil {
 		log.Fatalf("s3: %v", err)
 	}
-	engine, err := mailbox.New(ctx, store)
+	engine, err := mailbox.New(ctx, store, dataDir)
 	if err != nil {
 		log.Fatalf("mailbox: %v", err)
 	}

@@ -15,7 +15,7 @@ type Client struct {
 	api *sesv2.Client
 }
 
-// New loads the default credential chain in region (us-east-1 for generic.business).
+// New loads the default credential chain in region. generic.business send is ca-central-1.
 // The pod uses the projected service-account token, not an access key.
 func New(ctx context.Context, region string) (*Client, error) {
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
@@ -25,8 +25,7 @@ func New(ctx context.Context, region string) (*Client, error) {
 	return &Client{api: sesv2.NewFromConfig(cfg)}, nil
 }
 
-// SendRaw submits the RFC822 message. SES sandbox still applies: recipients
-// must be verified identities until production access is granted.
+// SendRaw submits the RFC822 message through the SES API in the configured region.
 func (c *Client) SendRaw(ctx context.Context, from string, rcpts []string, raw []byte) error {
 	_, err := c.api.SendEmail(ctx, &sesv2.SendEmailInput{
 		FromEmailAddress: aws.String(from),
