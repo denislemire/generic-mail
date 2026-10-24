@@ -229,10 +229,7 @@ func (s *session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria,
 	var data imap.SearchData
 	var seqSet imap.SeqSet
 	var uidSet imap.UIDSet
-	for _, msg := range s.box.Messages() {
-		if s.view != nil {
-			msg.Seq = s.view.EncodeSeqNum(msg.Seq)
-		}
+	for _, msg := range s.box.Messages(s.view) {
 		if msg.Seq == 0 {
 			continue
 		}
@@ -289,9 +286,6 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 			return
 		}
 		seq := msg.Seq
-		if s.view != nil {
-			seq = s.view.EncodeSeqNum(seq)
-		}
 		if seq == 0 {
 			return
 		}
@@ -305,8 +299,7 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 			}
 		}
 		if markSeen && !s.readOnly {
-			s.box.SetSeen([]imap.UID{msg.UID})
-			if err := s.srv.Engine.Commit(context.Background()); err != nil {
+			if err := s.box.SetSeen([]imap.UID{msg.UID}); err != nil {
 				fetchErr = err
 				return
 			}
@@ -334,8 +327,8 @@ func (s *session) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *im
 		return no("mailbox is read-only")
 	}
 	_ = options
-	changed := s.box.Store(numSet, flags.Op, flags.Flags, s.view)
-	if err := s.srv.Engine.Commit(context.Background()); err != nil {
+	changed, err := s.box.Store(numSet, flags.Op, flags.Flags, s.view)
+	if err != nil {
 		return err
 	}
 	if flags.Silent {
@@ -343,9 +336,6 @@ func (s *session) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *im
 	}
 	for _, msg := range changed {
 		seq := msg.Seq
-		if s.view != nil {
-			seq = s.view.EncodeSeqNum(seq)
-		}
 		if seq == 0 {
 			continue
 		}

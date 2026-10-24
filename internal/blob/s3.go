@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 
@@ -71,7 +72,15 @@ func (s *S3) Get(ctx context.Context, key string) ([]byte, error) {
 		return nil, err
 	}
 	defer out.Body.Close()
-	return io.ReadAll(out.Body)
+	const maxMessageBytes = 40 << 20
+	body, err := io.ReadAll(io.LimitReader(out.Body, maxMessageBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxMessageBytes {
+		return nil, fmt.Errorf("s3 message %q exceeds 40 MiB", key)
+	}
+	return body, nil
 }
 
 func (s *S3) Put(ctx context.Context, key string, body []byte) error {

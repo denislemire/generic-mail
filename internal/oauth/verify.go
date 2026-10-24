@@ -82,6 +82,7 @@ func (c *Checker) Accept(username, token string) error {
 		jwt.WithValidMethods([]string{jwt.SigningMethodRS256.Alg()}),
 		jwt.WithIssuer(c.issuer),
 		jwt.WithAudience(c.audience),
+		jwt.WithExpirationRequired(),
 		jwt.WithLeeway(30*time.Second),
 	)
 	if err != nil || !parsed.Valid {

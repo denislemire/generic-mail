@@ -4,10 +4,13 @@ import (
 	"context"
 	"crypto/subtle"
 	"crypto/tls"
+	"errors"
 	"io"
+	"log"
 	"net"
 	"net/mail"
 	"strings"
+	"time"
 
 	"github.com/denislemire/generic-mail/internal/oauth"
 
@@ -22,13 +25,15 @@ type Sender interface {
 
 // Server is an authenticated submission listener that relays to Sender.
 type Server struct {
-	Hostname  string
-	Username  string
-	Password  string
-	AllowFrom []string
-	Sender    Sender
-	MaxBytes  int64
-	OAuth     *oauth.Checker
+	Hostname     string
+	Username     string
+	Password     string
+	AllowFrom    []string
+	AllowDomains []string
+	SendTimeout  time.Duration
+	Sender       Sender
+	MaxBytes     int64
+	OAuth        *oauth.Checker
 }
 
 func (s *Server) NewSession(*smtp.Conn) (smtp.Session, error) {
@@ -70,7 +75,10 @@ func (s *session) AuthMechanisms() []string {
 func (s *session) Auth(mech string) (sasl.Server, error) {
 	switch strings.ToUpper(mech) {
 	case sasl.Plain:
-		return sasl.NewPlainServer(func(_, username, password string) error {
+		return sasl.NewPlainServer(func(identity, username, password string) error {
+			if identity != "" && !strings.EqualFold(identity, username) {
+				return smtp.ErrAuthFailed
+			}
 			userOK := subtle.ConstantTimeCompare([]byte(strings.ToLower(username)), []byte(strings.ToLower(s.srv.Username))) == 1
 			passOK := len(password) == len(s.srv.Password) && subtle.ConstantTimeCompare([]byte(password), []byte(s.srv.Password)) == 1
 			if !userOK || !passOK {
@@ -119,7 +127,7 @@ func (s *session) Rcpt(to string, _ *smtp.RcptOptions) error {
 		return &smtp.SMTPError{Code: 503, EnhancedCode: smtp.EnhancedCode{5, 5, 1}, Message: "MAIL first"}
 	}
 	addr := strings.Trim(to, "<>")
-	if _, err := mail.ParseAddress(addr); err != nil && !strings.Contains(addr, "@") {
+	if parsed, err := mail.ParseAddress(addr); err != nil || parsed.Address != addr {
 		return &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 1, 3}, Message: "invalid recipient"}
 	}
 	s.rcpts = append(s.rcpts, addr)
@@ -137,13 +145,28 @@ func (s *session) Data(r io.Reader) error {
 	if int64(len(raw)) > s.srv.maxBytes() {
 		return &smtp.SMTPError{Code: 552, EnhancedCode: smtp.EnhancedCode{5, 3, 4}, Message: "message too large"}
 	}
-	if err := s.srv.Sender.SendRaw(context.Background(), s.from, s.rcpts, raw); err != nil {
-		return &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 7, 1}, Message: err.Error()}
+	timeout := s.srv.SendTimeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := s.srv.Sender.SendRaw(ctx, s.from, s.rcpts, raw); err != nil {
+		log.Printf("submission delivery failed: %v", err)
+		var permanent interface{ Permanent() bool }
+		if errors.As(err, &permanent) && permanent.Permanent() {
+			return &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 7, 1}, Message: "message rejected by delivery service"}
+		}
+		return &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 3, 0}, Message: "delivery temporarily unavailable; please retry"}
 	}
 	return nil
 }
 
 func (s *session) allowed(from string) bool {
+	parsed, err := mail.ParseAddress(from)
+	if err != nil || parsed.Address != from {
+		return false
+	}
 	if from == strings.ToLower(s.srv.Username) {
 		return true
 	}
@@ -152,5 +175,14 @@ func (s *session) allowed(from string) bool {
 			return true
 		}
 	}
-	return strings.HasSuffix(from, "@generic.business")
+	_, domain, ok := strings.Cut(from, "@")
+	if !ok {
+		return false
+	}
+	for _, allowed := range s.srv.AllowDomains {
+		if strings.EqualFold(domain, strings.TrimSpace(allowed)) {
+			return true
+		}
+	}
+	return false
 }
