@@ -58,6 +58,10 @@ spec:
             - name: OAUTH_ALLOWED
               value: {{ join "," .Values.oauth.allowed | quote }}
             {{- end }}
+            - name: MAIL_ALLOWED_FROM
+              value: {{ join "," .Values.mailbox.allowedFrom | quote }}
+            - name: MAIL_ALLOWED_FROM_DOMAINS
+              value: {{ join "," .Values.mailbox.allowedFromDomains | quote }}
             - name: AWS_ROLE_ARN
               value: {{ .Values.aws.roleArn | quote }}
             - name: AWS_WEB_IDENTITY_TOKEN_FILE

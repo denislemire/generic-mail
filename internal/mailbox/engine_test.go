@@ -3,6 +3,8 @@ package mailbox
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"reflect"
 	"testing"
@@ -419,5 +421,219 @@ func TestFailedMutationsAreInvisible(t *testing.T) {
 				t.Fatal("failed mutation changed tracker count")
 			}
 		})
+	}
+}
+
+type progressStore struct {
+	*blob.Mem
+	engine    *Engine
+	reads     int
+	failAfter int
+}
+
+func (s *progressStore) Get(ctx context.Context, key string) ([]byte, error) {
+	s.reads++
+	if s.reads == 65 {
+		inbox, _ := s.engine.Open("INBOX")
+		if len(inbox.Messages()) < 64 {
+			return nil, fmt.Errorf("sync retained first batch without committing")
+		}
+	}
+	if s.failAfter > 0 && s.reads > s.failAfter {
+		return nil, fmt.Errorf("injected S3 failure")
+	}
+	return s.Mem.Get(ctx, key)
+}
+func TestSyncPersistsBoundedBatchesAndRetries(t *testing.T) {
+	ctx := context.Background()
+	store := &progressStore{Mem: blob.NewMem(), failAfter: 70}
+	dir := t.TempDir()
+	e, err := New(ctx, store, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.engine = e
+	for i := 0; i < 130; i++ {
+		store.PutMeta(fmt.Sprintf("inbound/%03d", i), []byte("Subject: hello\r\n\r\nbody"), time.Now())
+	}
+	if err = e.SyncInbound(ctx, ""); err == nil {
+		t.Fatal("expected download failure")
+	}
+	if e.Ready() {
+		t.Fatal("partial initial sync must not be ready")
+	}
+	restarted, err := New(ctx, store, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inbox, _ := restarted.Open("INBOX")
+	if len(inbox.Messages()) != 70 {
+		t.Fatalf("progress not durable: %d", len(inbox.Messages()))
+	}
+	store.engine = restarted
+	store.failAfter = 0
+	if err = restarted.SyncInbound(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if len(inbox.Messages()) != 130 || !restarted.Ready() {
+		t.Fatal("retry duplicated or lost messages")
+	}
+}
+func TestSetupNoticeUsesObjectName(t *testing.T) {
+	ctx := context.Background()
+	store := blob.NewMem()
+	e, err := New(ctx, store, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.PutMeta("inbound/normal", []byte("Subject: support\r\n\r\nPlease explain amazon_ses_setup_notification"), time.Now())
+	store.PutMeta("inbound/AMAZON_SES_SETUP_NOTIFICATION", []byte("setup probe"), time.Now())
+	if err = e.SyncInbound(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	inbox, _ := e.Open("INBOX")
+	if len(inbox.Messages()) != 1 || inbox.Messages()[0].Key != "inbound/normal" {
+		t.Fatalf("wrong objects imported: %+v", inbox.Messages())
+	}
+}
+func TestInboundInternalDateUsesReceiptTime(t *testing.T) {
+	ctx := context.Background()
+	store := blob.NewMem()
+	e, err := New(ctx, store, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	received := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
+	store.PutMeta("inbound/one", []byte("Date: Thu, 01 Jan 1970 00:00:00 +0000\r\n\r\nbody"), received)
+	if err = e.SyncInbound(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	inbox, _ := e.Open("INBOX")
+	if !inbox.Messages()[0].Internal.Equal(received) {
+		t.Fatal("sender date replaced receipt time")
+	}
+}
+
+type deleteStore struct {
+	*blob.Mem
+	failDelete bool
+	deletes    int
+}
+
+func (s *deleteStore) Delete(ctx context.Context, key string) error {
+	s.deletes++
+	if s.failDelete {
+		return fmt.Errorf("injected delete failure")
+	}
+	return s.Mem.Delete(ctx, key)
+}
+func trashFixture(t *testing.T, store blob.Store, dir string) (*Engine, *Box, *Box) {
+	t.Helper()
+	ctx := context.Background()
+	if err := store.Put(ctx, "inbound/one", []byte("Subject: hello\r\n\r\nbody")); err != nil {
+		t.Fatal(err)
+	}
+	e, err := New(ctx, store, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = e.SyncInbound(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	inbox, _ := e.Open("INBOX")
+	trash, _ := e.Open("Trash")
+	if _, err = inbox.Copy(ctx, imap.UIDSetNum(1), "Trash"); err != nil {
+		t.Fatal(err)
+	}
+	return e, inbox, trash
+}
+func flagAndExpunge(t *testing.T, b *Box) {
+	t.Helper()
+	if _, err := b.Store(imap.UIDSetNum(1), imap.StoreFlagsAdd, []imap.Flag{imap.FlagDeleted}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Expunge(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+}
+func TestTrashExpungeDeletesSourceAfterMove(t *testing.T) {
+	ctx := context.Background()
+	store := &deleteStore{Mem: blob.NewMem()}
+	dir := t.TempDir()
+	_, inbox, trash := trashFixture(t, store, dir)
+	flagAndExpunge(t, inbox)
+	if store.deletes != 0 {
+		t.Fatal("INBOX expunge deleted S3")
+	}
+	flagAndExpunge(t, trash)
+	if _, err := store.Get(ctx, "inbound/one"); !errors.Is(err, blob.ErrNotFound) {
+		t.Fatalf("source not deleted: %v", err)
+	}
+	restarted, err := New(ctx, store, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = restarted.SyncInbound(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	inbox, _ = restarted.Open("INBOX")
+	if len(inbox.Messages()) != 0 || len(restarted.deletes) != 0 {
+		t.Fatal("deleted mail resurrected or queue not cleared")
+	}
+}
+func TestTrashDeletionWaitsForLiveS3Reference(t *testing.T) {
+	store := &deleteStore{Mem: blob.NewMem()}
+	e, inbox, trash := trashFixture(t, store, t.TempDir())
+	flagAndExpunge(t, trash)
+	if store.deletes != 0 || len(e.deletes) != 1 {
+		t.Fatal("live INBOX reference must defer deletion")
+	}
+	msg := inbox.Messages()[0]
+	if _, err := e.Body(context.Background(), msg.Loc, msg.Key); err != nil {
+		t.Fatal(err)
+	}
+	flagAndExpunge(t, inbox)
+	if store.deletes != 1 || len(e.deletes) != 0 {
+		t.Fatal("deferred deletion not drained after last reference removed")
+	}
+}
+func TestTrashDeleteRetriesAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	store := &deleteStore{Mem: blob.NewMem(), failDelete: true}
+	dir := t.TempDir()
+	_, inbox, trash := trashFixture(t, store, dir)
+	flagAndExpunge(t, inbox)
+	flagAndExpunge(t, trash)
+	restarted, err := New(ctx, store, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(restarted.deletes) != 1 {
+		t.Fatal("delete intent was not durable")
+	}
+	store.failDelete = false
+	if err = restarted.SyncInbound(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if len(restarted.deletes) != 0 || store.deletes != 2 {
+		t.Fatal("retry did not acknowledge delete")
+	}
+	if _, err = store.Get(ctx, "inbound/one"); !errors.Is(err, blob.ErrNotFound) {
+		t.Fatal("source still exists")
+	}
+}
+func TestFailedTrashExpungeDoesNotDeleteS3(t *testing.T) {
+	store := &deleteStore{Mem: blob.NewMem()}
+	e, inbox, trash := trashFixture(t, store, t.TempDir())
+	flagAndExpunge(t, inbox)
+	if _, err := trash.Store(imap.UIDSetNum(1), imap.StoreFlagsAdd, []imap.Flag{imap.FlagDeleted}, nil); err != nil {
+		t.Fatal(err)
+	}
+	e.db.Close()
+	if err := trash.Expunge(context.Background(), nil); err == nil {
+		t.Fatal("expected commit failure")
+	}
+	if store.deletes != 0 || len(e.deletes) != 0 || len(trash.Messages()) != 1 {
+		t.Fatal("failed expunge published deletion")
 	}
 }

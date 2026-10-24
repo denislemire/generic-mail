@@ -34,8 +34,9 @@ type Msg struct {
 
 // Snap is a full index.
 type Snap struct {
-	Boxes []Box
-	Seen  []string
+	Boxes   []Box
+	Seen    []string
+	Deletes []string
 }
 
 // DB is the SQLite index.
@@ -153,7 +154,22 @@ func (d *DB) load() (Snap, error) {
 		}
 		snap.Seen = append(snap.Seen, key)
 	}
-	return snap, srows.Err()
+	if err := srows.Err(); err != nil {
+		return snap, err
+	}
+	drows, err := d.sql.Query(`SELECT key FROM pending_delete`)
+	if err != nil {
+		return snap, err
+	}
+	defer drows.Close()
+	for drows.Next() {
+		var key string
+		if err = drows.Scan(&key); err != nil {
+			return snap, err
+		}
+		snap.Deletes = append(snap.Deletes, key)
+	}
+	return snap, drows.Err()
 }
 
 // Save applies only changed rows, atomically. The cached snapshot advances only
@@ -237,6 +253,23 @@ func (d *DB) Save(snap Snap) error {
 			return err
 		}
 	}
+	oldDeletes := map[string]struct{}{}
+	for _, key := range d.last.Deletes {
+		oldDeletes[key] = struct{}{}
+	}
+	for _, key := range snap.Deletes {
+		if _, exists := oldDeletes[key]; !exists {
+			if _, err = tx.Exec(`INSERT INTO pending_delete (key) VALUES (?)`, key); err != nil {
+				return err
+			}
+		}
+		delete(oldDeletes, key)
+	}
+	for key := range oldDeletes {
+		if _, err = tx.Exec(`DELETE FROM pending_delete WHERE key=?`, key); err != nil {
+			return err
+		}
+	}
 	if err = tx.Commit(); err != nil {
 		return err
 	}
@@ -245,7 +278,7 @@ func (d *DB) Save(snap Snap) error {
 }
 
 func cloneSnap(s Snap) Snap {
-	out := Snap{Boxes: append([]Box(nil), s.Boxes...), Seen: append([]string(nil), s.Seen...)}
+	out := Snap{Boxes: append([]Box(nil), s.Boxes...), Seen: append([]string(nil), s.Seen...), Deletes: append([]string(nil), s.Deletes...)}
 	for i := range out.Boxes {
 		out.Boxes[i].Messages = append([]Msg(nil), s.Boxes[i].Messages...)
 		for j := range out.Boxes[i].Messages {
@@ -272,6 +305,9 @@ CREATE TABLE IF NOT EXISTS message (
   internal TEXT NOT NULL,
   flags TEXT NOT NULL DEFAULT '[]',
   PRIMARY KEY (mailbox, uid)
+);
+CREATE TABLE IF NOT EXISTS pending_delete (
+ key TEXT PRIMARY KEY
 );
 CREATE TABLE IF NOT EXISTS seen (
   key TEXT PRIMARY KEY
