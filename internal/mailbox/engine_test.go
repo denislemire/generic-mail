@@ -280,3 +280,71 @@ func newKeys(before, after map[string]struct{}) []string {
 	}
 	return extra
 }
+
+func TestSelectedHandleSurvivesRename(t *testing.T) {
+	ctx := context.Background()
+	e, err := New(ctx, blob.NewMem(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = e.Create(ctx, "Archive"); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := e.Open("Archive")
+	tracker := b.Tracker()
+	if err = e.Rename(ctx, "Archive", "Old"); err != nil {
+		t.Fatal(err)
+	}
+	if b.Name() != "Old" || !b.Exists() || b.Tracker() != tracker {
+		t.Fatal("rename changed selected mailbox identity")
+	}
+	if _, err = b.Append(ctx, bytes.NewBufferString("Subject: x\r\n\r\nbody"), nil); err != nil {
+		t.Fatal(err)
+	}
+	reopened, _ := e.Open("Old")
+	if len(reopened.Messages()) != 1 {
+		t.Fatal("selected append lost after rename")
+	}
+}
+
+func TestSequenceSelectionWithPendingExpunge(t *testing.T) {
+	ctx := context.Background()
+	e, err := New(ctx, blob.NewMem(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := e.Open("Drafts")
+	for i := 0; i < 3; i++ {
+		if _, err = b.Append(ctx, bytes.NewBufferString("Subject: x\r\n\r\nbody"), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err = e.Create(ctx, "Archive"); err != nil {
+		t.Fatal(err)
+	}
+	view := b.Tracker().NewSession()
+	defer view.Close()
+	b.Store(imap.UIDSetNum(1), imap.StoreFlagsAdd, []imap.Flag{imap.FlagDeleted}, nil)
+	if err = b.Expunge(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	set := imap.SeqSetNum(2)
+	var got []imap.UID
+	b.ForEach(set, func(msg Msg) { got = append(got, msg.UID) }, view)
+	if len(got) != 1 || got[0] != 2 {
+		t.Fatalf("FETCH selected UIDs %v", got)
+	}
+	changed := b.Store(set, imap.StoreFlagsAdd, []imap.Flag{imap.FlagFlagged}, view)
+	if len(changed) != 1 || changed[0].UID != 2 {
+		t.Fatalf("STORE selected %+v", changed)
+	}
+	copied, err := b.Copy(ctx, set, "Archive", view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !copied.SourceUIDs.Contains(2) || copied.SourceUIDs.Contains(3) {
+		t.Fatalf("COPY selected %v", copied.SourceUIDs)
+	}
+	// The deleted message's old sequence number must never select its successor.
+	b.ForEach(imap.SeqSetNum(1), func(msg Msg) { t.Fatalf("selected expunged sequence: %+v", msg) }, view)
+}

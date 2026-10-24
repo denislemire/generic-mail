@@ -545,8 +545,8 @@ func (e *Engine) rememberLocked(loc, key string, raw []byte) {
 
 // Box is one mailbox handle used by an authenticated session.
 type Box struct {
-	e    *Engine
-	name string
+	e      *Engine
+	target *box
 }
 
 // Commit writes the UID and flag state back to the blob store.
@@ -560,7 +560,7 @@ func (e *Engine) Open(name string) (*Box, error) {
 	if !ok {
 		return nil, errNo("no such mailbox")
 	}
-	return &Box{e: e, name: canon}, nil
+	return &Box{e: e, target: e.boxes[canon]}, nil
 }
 
 func (e *Engine) resolveLocked(name string) (string, bool) {
@@ -575,9 +575,20 @@ func (e *Engine) resolveLocked(name string) (string, bool) {
 	return "", false
 }
 
-func (b *Box) Name() string { return b.name }
+func (b *Box) Name() string {
+	b.e.mu.Lock()
+	defer b.e.mu.Unlock()
+	return b.target.name
+}
 
-func (b *Box) box() *box { return b.e.boxes[b.name] }
+// Exists reports whether the mailbox still exists, including after a rename.
+func (b *Box) Exists() bool {
+	b.e.mu.Lock()
+	defer b.e.mu.Unlock()
+	return b.e.boxes[b.target.name] == b.target
+}
+
+func (b *Box) box() *box { return b.target }
 
 // ListData is the LIST metadata for every mailbox.
 func (e *Engine) ListData(subscribedOnly, specialOnly, wantSpecial bool) []imap.ListData {
@@ -630,6 +641,8 @@ func (b *Box) SelectData() *imap.SelectData {
 
 // Tracker is the mailbox's unilateral-update tracker.
 func (b *Box) Tracker() *imapserver.MailboxTracker {
+	b.e.mu.Lock()
+	defer b.e.mu.Unlock()
 	return b.box().tracker
 }
 
@@ -684,7 +697,7 @@ func (b *Box) StatusData(opts *imap.StatusOptions) *imap.StatusData {
 
 // Append stores a message as a local file. INBOX is the SES receipt set.
 func (b *Box) Append(ctx context.Context, r io.Reader, opts *imap.AppendOptions) (*imap.AppendData, error) {
-	if b.name == BoxINBOX {
+	if b.Name() == BoxINBOX {
 		return nil, errNo("INBOX only accepts mail delivered by SES")
 	}
 	raw, err := io.ReadAll(io.LimitReader(r, 30<<20+1))
@@ -708,7 +721,7 @@ func (b *Box) Append(ctx context.Context, r io.Reader, opts *imap.AppendOptions)
 	}
 	b.e.mu.Lock()
 	bx := b.box()
-	if bx == nil {
+	if b.e.boxes[bx.name] != bx {
 		b.e.mu.Unlock()
 		return nil, errNo("no such mailbox")
 	}
@@ -761,14 +774,15 @@ type Msg struct {
 
 // ForEach calls fn for each selected message. The mailbox lock is released
 // before fn runs, so fn may call Body without deadlocking.
-func (b *Box) ForEach(numSet imap.NumSet, fn func(Msg)) {
+func (b *Box) ForEach(numSet imap.NumSet, fn func(Msg), views ...*imapserver.SessionTracker) {
+	view := firstView(views)
 	b.e.mu.Lock()
 	bx := b.box()
-	numSet = staticNumSet(numSet, bx)
+	numSet = staticNumSetView(numSet, bx, view)
 	matched := make([]Msg, 0)
 	for i, m := range bx.msgs {
 		seq := uint32(i + 1)
-		if !contains(numSet, seq, m.uid) {
+		if !containsView(numSet, seq, m.uid, view) {
 			continue
 		}
 		matched = append(matched, Msg{
@@ -817,11 +831,11 @@ func (b *Box) Store(numSet imap.NumSet, op imap.StoreFlagsOp, flags []imap.Flag,
 	b.e.mu.Lock()
 	defer b.e.mu.Unlock()
 	bx := b.box()
-	numSet = staticNumSet(numSet, bx)
+	numSet = staticNumSetView(numSet, bx, session)
 	var changed []Msg
 	for i, m := range bx.msgs {
 		seq := uint32(i + 1)
-		if !contains(numSet, seq, m.uid) {
+		if !containsView(numSet, seq, m.uid, session) {
 			continue
 		}
 		applyFlags(m.flags, op, flags)
@@ -901,7 +915,8 @@ func (e *Engine) fileUsedLocked(id string) bool {
 
 // Copy writes a local file for each message and points the destination at it.
 // The source object, including inbound S3, is left unchanged.
-func (b *Box) Copy(ctx context.Context, numSet imap.NumSet, destName string) (*imap.CopyData, error) {
+func (b *Box) Copy(ctx context.Context, numSet imap.NumSet, destName string, views ...*imapserver.SessionTracker) (*imap.CopyData, error) {
+	view := firstView(views)
 	b.e.mu.Lock()
 	dest, ok := b.e.resolveLocked(destName)
 	if !ok {
@@ -913,7 +928,7 @@ func (b *Box) Copy(ctx context.Context, numSet imap.NumSet, destName string) (*i
 		return nil, errNo("INBOX only accepts mail delivered by SES")
 	}
 	src := b.box()
-	numSet = staticNumSet(numSet, src)
+	numSet = staticNumSetView(numSet, src, view)
 	type item struct {
 		loc, key, source string
 		internal         time.Time
@@ -924,7 +939,7 @@ func (b *Box) Copy(ctx context.Context, numSet imap.NumSet, destName string) (*i
 	var srcUIDs imap.UIDSet
 	for i, m := range src.msgs {
 		seq := uint32(i + 1)
-		if !contains(numSet, seq, m.uid) {
+		if !containsView(numSet, seq, m.uid, view) {
 			continue
 		}
 		source := m.source
@@ -1171,14 +1186,43 @@ func contains(numSet imap.NumSet, seq uint32, uid imap.UID) bool {
 }
 
 func staticNumSet(numSet imap.NumSet, bx *box) imap.NumSet {
+	return staticNumSetView(numSet, bx, nil)
+}
+
+func firstView(views []*imapserver.SessionTracker) *imapserver.SessionTracker {
+	if len(views) > 0 {
+		return views[0]
+	}
+	return nil
+}
+
+func containsView(set imap.NumSet, seq uint32, uid imap.UID, view *imapserver.SessionTracker) bool {
+	if _, ok := set.(imap.SeqSet); ok && view != nil {
+		seq = view.EncodeSeqNum(seq)
+		if seq == 0 {
+			return false
+		}
+	}
+	return contains(set, seq, uid)
+}
+
+func staticNumSetView(numSet imap.NumSet, bx *box, view *imapserver.SessionTracker) imap.NumSet {
 	switch s := numSet.(type) {
 	case imap.SeqSet:
+		s = append(imap.SeqSet(nil), s...)
 		max := uint32(len(bx.msgs))
+		if view != nil {
+			for max > 0 && view.EncodeSeqNum(max) == 0 {
+				max--
+			}
+			max = view.EncodeSeqNum(max)
+		}
 		for i := range s {
 			staticRange(&s[i].Start, &s[i].Stop, max)
 		}
 		return s
 	case imap.UIDSet:
+		s = append(imap.UIDSet(nil), s...)
 		max := uint32(0)
 		if bx.uidNext > 1 {
 			max = uint32(bx.uidNext - 1)
