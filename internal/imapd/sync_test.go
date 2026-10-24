@@ -240,3 +240,36 @@ func TestQResyncDoesNotSkipDeferredExpunge(t *testing.T) {
 	has(t, out, "VANISHED 2")
 	has(t, out, "UID 3 FLAGS (finance) MODSEQ")
 }
+
+func TestQResyncUIDSearchSequenceCriteriaDefersVanished(t *testing.T) {
+	e, _, _ := seeded(t)
+	a, b := syncWire(t, e), syncWire(t, e)
+	a.ok("ENABLE QRESYNC")
+	a.ok("SELECT Drafts")
+	b.ok("SELECT Drafts")
+	b.ok(`UID STORE 2 +FLAGS (\Deleted)`)
+	b.ok("UID EXPUNGE 2")
+	out := a.ok("UID SEARCH OR 3 UID 1")
+	has(t, out, "* SEARCH 1 3")
+	lacks(t, out, "VANISHED")
+	has(t, out, "HIGHESTMODSEQ")
+	has(t, a.ok("NOOP"), "VANISHED 2")
+}
+func TestCondStoreExtendedSearchModSeq(t *testing.T) {
+	e, _, _ := seeded(t)
+	a := syncWire(t, e)
+	a.ok("SELECT Drafts (CONDSTORE)")
+	out := a.ok("UID STORE 2 +FLAGS (Finance)")
+	middle := number(t, out, "MODSEQ")
+	for _, tc := range []struct {
+		option string
+		want   uint64
+	}{{"MIN", 2}, {"MAX", 4}, {"MIN MAX", 4}, {"COUNT", middle}, {"MIN COUNT", middle}, {"ALL", middle}} {
+		out := a.ok("UID SEARCH RETURN (" + tc.option + ") MODSEQ 0")
+		if got := number(t, out, "MODSEQ"); got != tc.want {
+			t.Fatalf("%s: got %d want %d: %s", tc.option, got, tc.want, out)
+		}
+	}
+	out = a.ok(`UID SEARCH MODSEQ "/flags/\\seen" all 0`)
+	has(t, out, "* SEARCH 1 2 3 (MODSEQ")
+}

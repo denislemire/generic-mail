@@ -232,7 +232,9 @@ func (s *session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria,
 	if err := s.selected(); err != nil {
 		return nil, err
 	}
-	_ = options
+	if options == nil {
+		options = &imap.SearchOptions{ReturnAll: true}
+	}
 	messages := s.box.Messages(s.view)
 	var candidates map[state.ContentKey]bool
 	if query := mailbox.SearchIndexQuery(criteria); query != "" {
@@ -242,6 +244,7 @@ func (s *session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria,
 		}
 	}
 	var data imap.SearchData
+	var minMod, maxMod uint64
 	var seqSet imap.SeqSet
 	var uidSet imap.UIDSet
 	for _, msg := range messages {
@@ -275,13 +278,24 @@ func (s *session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria,
 		}
 		if data.Min == 0 || num < data.Min {
 			data.Min = num
+			minMod = msg.ModSeq
 		}
 		if data.Max == 0 || num > data.Max {
 			data.Max = num
+			maxMod = msg.ModSeq
 		}
 		data.Count++
 		if hasModSeq(criteria) && msg.ModSeq > data.ModSeq {
 			data.ModSeq = msg.ModSeq
+		}
+	}
+	if hasModSeq(criteria) && !options.ReturnAll && !options.ReturnCount {
+		data.ModSeq = 0
+		if options.ReturnMin {
+			data.ModSeq = minMod
+		}
+		if options.ReturnMax && maxMod > data.ModSeq {
+			data.ModSeq = maxMod
 		}
 	}
 	switch kind {
