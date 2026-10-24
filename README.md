@@ -13,3 +13,5 @@ When `OAUTH_JWKS_URL` is set, IMAP and submission also advertise `XOAUTH2` and `
 Required environment: `MAIL_USERNAME`, `MAIL_PASSWORD`, `MAIL_HOSTNAME`, `S3_BUCKET`. `MAIL_DATA` is the writable directory for the SQLite index and local message files.
 
 The chart defaults are generic. A cluster sets the bucket, hostname, role, and image in its own values.
+
+Retention belongs in S3 configuration. With [S3 Versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/DeletingObjectVersions.html) enabled, the gateway's ordinary `DeleteObject` call creates a delete marker; it does not erase historical versions. Configure noncurrent-version lifecycle rules for the desired recovery window. For enforced retention periods or legal holds, use [S3 Object Lock](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html). Locked versions remain protected even when a delete marker hides the message from normal mailbox access. The gateway never specifies a version ID or requests a retention bypass, and its role does not need `s3:DeleteObjectVersion` or retention-bypass permissions. This chart does not configure bucket versioning, lifecycle, or Object Lock.
