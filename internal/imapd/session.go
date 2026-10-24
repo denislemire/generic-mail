@@ -229,7 +229,10 @@ func (s *session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria,
 	var data imap.SearchData
 	var seqSet imap.SeqSet
 	var uidSet imap.UIDSet
-	for _, msg := range s.box.Messages() {
+	for _, msg := range s.box.Messages(s.view) {
+		if msg.Seq == 0 {
+			continue
+		}
 		raw, err := s.srv.Engine.Body(context.Background(), msg.Loc, msg.Key)
 		if err != nil {
 			return nil, err
@@ -282,6 +285,10 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 		if fetchErr != nil {
 			return
 		}
+		seq := msg.Seq
+		if seq == 0 {
+			return
+		}
 		var raw []byte
 		if fetchNeedsBody(options) {
 			var err error
@@ -292,8 +299,7 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 			}
 		}
 		if markSeen && !s.readOnly {
-			s.box.SetSeen([]imap.UID{msg.UID})
-			if err := s.srv.Engine.Commit(context.Background()); err != nil {
+			if err := s.box.SetSeen([]imap.UID{msg.UID}); err != nil {
 				fetchErr = err
 				return
 			}
@@ -305,17 +311,11 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 				msg.Flags = append(msg.Flags, imap.FlagSeen)
 			}
 		}
-		seq := msg.Seq
-		if s.view != nil {
-			if encoded := s.view.EncodeSeqNum(seq); encoded != 0 {
-				seq = encoded
-			}
-		}
 		mw := w.CreateMessage(seq)
 		responseOptions := *options
 		responseOptions.Flags = options.Flags || (markSeen && !s.readOnly)
 		fetchErr = writeFetch(mw, msg, raw, &responseOptions)
-	})
+	}, s.view)
 	return fetchErr
 }
 
@@ -327,8 +327,8 @@ func (s *session) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *im
 		return no("mailbox is read-only")
 	}
 	_ = options
-	changed := s.box.Store(numSet, flags.Op, flags.Flags, s.view)
-	if err := s.srv.Engine.Commit(context.Background()); err != nil {
+	changed, err := s.box.Store(numSet, flags.Op, flags.Flags, s.view)
+	if err != nil {
 		return err
 	}
 	if flags.Silent {
@@ -336,10 +336,8 @@ func (s *session) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *im
 	}
 	for _, msg := range changed {
 		seq := msg.Seq
-		if s.view != nil {
-			if encoded := s.view.EncodeSeqNum(seq); encoded != 0 {
-				seq = encoded
-			}
+		if seq == 0 {
+			continue
 		}
 		mw := w.CreateMessage(seq)
 		if err := writeFetch(mw, msg, nil, &imap.FetchOptions{Flags: true}); err != nil {
@@ -356,14 +354,14 @@ func (s *session) Copy(numSet imap.NumSet, dest string) (*imap.CopyData, error) 
 	if s.readOnly {
 		return nil, no("mailbox is read-only")
 	}
-	return s.box.Copy(context.Background(), numSet, dest)
+	return s.box.Copy(context.Background(), numSet, dest, s.view)
 }
 
 func (s *session) selected() error {
 	if err := s.needAuth(); err != nil {
 		return err
 	}
-	if s.box == nil {
+	if s.box == nil || !s.box.Exists() {
 		return no("select a mailbox")
 	}
 	return nil

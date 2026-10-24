@@ -3,6 +3,10 @@ package mailbox
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
+	"os"
+	"reflect"
 	"testing"
 	"time"
 
@@ -279,4 +283,357 @@ func newKeys(before, after map[string]struct{}) []string {
 		}
 	}
 	return extra
+}
+
+func TestSelectedHandleSurvivesRename(t *testing.T) {
+	ctx := context.Background()
+	e, err := New(ctx, blob.NewMem(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = e.Create(ctx, "Archive"); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := e.Open("Archive")
+	tracker := b.Tracker()
+	if err = e.Rename(ctx, "Archive", "Old"); err != nil {
+		t.Fatal(err)
+	}
+	if b.Name() != "Old" || !b.Exists() || b.Tracker() != tracker {
+		t.Fatal("rename changed selected mailbox identity")
+	}
+	if _, err = b.Append(ctx, bytes.NewBufferString("Subject: x\r\n\r\nbody"), nil); err != nil {
+		t.Fatal(err)
+	}
+	reopened, _ := e.Open("Old")
+	if len(reopened.Messages()) != 1 {
+		t.Fatal("selected append lost after rename")
+	}
+}
+
+func TestSequenceSelectionWithPendingExpunge(t *testing.T) {
+	ctx := context.Background()
+	e, err := New(ctx, blob.NewMem(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := e.Open("Drafts")
+	for i := 0; i < 3; i++ {
+		if _, err = b.Append(ctx, bytes.NewBufferString("Subject: x\r\n\r\nbody"), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err = e.Create(ctx, "Archive"); err != nil {
+		t.Fatal(err)
+	}
+	view := b.Tracker().NewSession()
+	defer view.Close()
+	b.Store(imap.UIDSetNum(1), imap.StoreFlagsAdd, []imap.Flag{imap.FlagDeleted}, nil)
+	if err = b.Expunge(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	set := imap.SeqSetNum(2)
+	var got []imap.UID
+	b.ForEach(set, func(msg Msg) { got = append(got, msg.UID) }, view)
+	if len(got) != 1 || got[0] != 2 {
+		t.Fatalf("FETCH selected UIDs %v", got)
+	}
+	changed, err := b.Store(set, imap.StoreFlagsAdd, []imap.Flag{imap.FlagFlagged}, view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changed) != 1 || changed[0].UID != 2 {
+		t.Fatalf("STORE selected %+v", changed)
+	}
+	copied, err := b.Copy(ctx, set, "Archive", view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !copied.SourceUIDs.Contains(2) || copied.SourceUIDs.Contains(3) {
+		t.Fatalf("COPY selected %v", copied.SourceUIDs)
+	}
+	// The deleted message's old sequence number must never select its successor.
+	b.ForEach(imap.SeqSetNum(1), func(msg Msg) { t.Fatalf("selected expunged sequence: %+v", msg) }, view)
+}
+
+func TestFailedMutationsAreInvisible(t *testing.T) {
+	operations := map[string]func(context.Context, *Engine, *Box) error{
+		"append": func(ctx context.Context, e *Engine, b *Box) error {
+			_, err := b.Append(ctx, bytes.NewBufferString("Subject: x\r\n\r\nbody"), nil)
+			return err
+		},
+		"copy": func(ctx context.Context, e *Engine, b *Box) error {
+			_, err := b.Copy(ctx, imap.UIDSetNum(1), "Archive")
+			return err
+		},
+		"store": func(ctx context.Context, e *Engine, b *Box) error {
+			_, err := b.Store(imap.UIDSetNum(1), imap.StoreFlagsAdd, []imap.Flag{imap.FlagSeen}, nil)
+			return err
+		},
+		"seen":      func(ctx context.Context, e *Engine, b *Box) error { return b.SetSeen([]imap.UID{1}) },
+		"expunge":   func(ctx context.Context, e *Engine, b *Box) error { return b.Expunge(ctx, nil) },
+		"create":    func(ctx context.Context, e *Engine, b *Box) error { return e.Create(ctx, "New") },
+		"rename":    func(ctx context.Context, e *Engine, b *Box) error { return e.Rename(ctx, "Archive", "New") },
+		"delete":    func(ctx context.Context, e *Engine, b *Box) error { return e.Delete(ctx, "Archive") },
+		"subscribe": func(ctx context.Context, e *Engine, b *Box) error { return b.SetSubscribed(ctx, false) },
+		"sync":      func(ctx context.Context, e *Engine, b *Box) error { return e.SyncInbound(ctx, "") },
+	}
+	for name, operation := range operations {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			store := blob.NewMem()
+			e, err := New(ctx, store, t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = e.Create(ctx, "Archive"); err != nil {
+				t.Fatal(err)
+			}
+			b, _ := e.Open("Drafts")
+			if _, err = b.Append(ctx, bytes.NewBufferString("Subject: x\r\n\r\nbody"), nil); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = b.Store(imap.UIDSetNum(1), imap.StoreFlagsAdd, []imap.Flag{imap.FlagDeleted}, nil); err != nil {
+				t.Fatal(err)
+			}
+			store.PutMeta("inbound/new", []byte("Subject: new\r\n\r\nbody"), time.Now())
+			before := e.snapshotLocked()
+			beforeFiles, _ := os.ReadDir(e.files)
+			if err = e.db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err = operation(ctx, e, b); err == nil {
+				t.Fatal("expected failure")
+			}
+			if !reflect.DeepEqual(before, e.snapshotLocked()) {
+				t.Fatal("failed mutation changed visible index")
+			}
+			if e.Ready() {
+				t.Fatal("failed sync changed readiness")
+			}
+			afterFiles, _ := os.ReadDir(e.files)
+			if len(afterFiles) != len(beforeFiles) {
+				t.Fatal("failed mutation leaked files")
+			}
+			tracker := b.Tracker().NewSession()
+			defer tracker.Close()
+			if tracker.EncodeSeqNum(1) != 1 || tracker.EncodeSeqNum(2) != 0 {
+				t.Fatal("failed mutation changed tracker count")
+			}
+		})
+	}
+}
+
+type progressStore struct {
+	*blob.Mem
+	engine    *Engine
+	reads     int
+	failAfter int
+}
+
+func (s *progressStore) Get(ctx context.Context, key string) ([]byte, error) {
+	s.reads++
+	if s.reads == 65 {
+		inbox, _ := s.engine.Open("INBOX")
+		if len(inbox.Messages()) < 64 {
+			return nil, fmt.Errorf("sync retained first batch without committing")
+		}
+	}
+	if s.failAfter > 0 && s.reads > s.failAfter {
+		return nil, fmt.Errorf("injected S3 failure")
+	}
+	return s.Mem.Get(ctx, key)
+}
+func TestSyncPersistsBoundedBatchesAndRetries(t *testing.T) {
+	ctx := context.Background()
+	store := &progressStore{Mem: blob.NewMem(), failAfter: 70}
+	dir := t.TempDir()
+	e, err := New(ctx, store, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.engine = e
+	for i := 0; i < 130; i++ {
+		store.PutMeta(fmt.Sprintf("inbound/%03d", i), []byte("Subject: hello\r\n\r\nbody"), time.Now())
+	}
+	if err = e.SyncInbound(ctx, ""); err == nil {
+		t.Fatal("expected download failure")
+	}
+	if e.Ready() {
+		t.Fatal("partial initial sync must not be ready")
+	}
+	restarted, err := New(ctx, store, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inbox, _ := restarted.Open("INBOX")
+	if len(inbox.Messages()) != 70 {
+		t.Fatalf("progress not durable: %d", len(inbox.Messages()))
+	}
+	store.engine = restarted
+	store.failAfter = 0
+	if err = restarted.SyncInbound(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if len(inbox.Messages()) != 130 || !restarted.Ready() {
+		t.Fatal("retry duplicated or lost messages")
+	}
+}
+func TestSetupNoticeUsesObjectName(t *testing.T) {
+	ctx := context.Background()
+	store := blob.NewMem()
+	e, err := New(ctx, store, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.PutMeta("inbound/normal", []byte("Subject: support\r\n\r\nPlease explain amazon_ses_setup_notification"), time.Now())
+	store.PutMeta("inbound/AMAZON_SES_SETUP_NOTIFICATION", []byte("setup probe"), time.Now())
+	if err = e.SyncInbound(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	inbox, _ := e.Open("INBOX")
+	if len(inbox.Messages()) != 1 || inbox.Messages()[0].Key != "inbound/normal" {
+		t.Fatalf("wrong objects imported: %+v", inbox.Messages())
+	}
+}
+func TestInboundInternalDateUsesReceiptTime(t *testing.T) {
+	ctx := context.Background()
+	store := blob.NewMem()
+	e, err := New(ctx, store, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	received := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
+	store.PutMeta("inbound/one", []byte("Date: Thu, 01 Jan 1970 00:00:00 +0000\r\n\r\nbody"), received)
+	if err = e.SyncInbound(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	inbox, _ := e.Open("INBOX")
+	if !inbox.Messages()[0].Internal.Equal(received) {
+		t.Fatal("sender date replaced receipt time")
+	}
+}
+
+type deleteStore struct {
+	*blob.Mem
+	failDelete bool
+	deletes    int
+}
+
+func (s *deleteStore) Delete(ctx context.Context, key string) error {
+	s.deletes++
+	if s.failDelete {
+		return fmt.Errorf("injected delete failure")
+	}
+	return s.Mem.Delete(ctx, key)
+}
+func trashFixture(t *testing.T, store blob.Store, dir string) (*Engine, *Box, *Box) {
+	t.Helper()
+	ctx := context.Background()
+	if err := store.Put(ctx, "inbound/one", []byte("Subject: hello\r\n\r\nbody")); err != nil {
+		t.Fatal(err)
+	}
+	e, err := New(ctx, store, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = e.SyncInbound(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	inbox, _ := e.Open("INBOX")
+	trash, _ := e.Open("Trash")
+	if _, err = inbox.Copy(ctx, imap.UIDSetNum(1), "Trash"); err != nil {
+		t.Fatal(err)
+	}
+	return e, inbox, trash
+}
+func flagAndExpunge(t *testing.T, b *Box) {
+	t.Helper()
+	if _, err := b.Store(imap.UIDSetNum(1), imap.StoreFlagsAdd, []imap.Flag{imap.FlagDeleted}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Expunge(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+}
+func TestTrashExpungeDeletesSourceAfterMove(t *testing.T) {
+	ctx := context.Background()
+	store := &deleteStore{Mem: blob.NewMem()}
+	dir := t.TempDir()
+	_, inbox, trash := trashFixture(t, store, dir)
+	flagAndExpunge(t, inbox)
+	if store.deletes != 0 {
+		t.Fatal("INBOX expunge deleted S3")
+	}
+	flagAndExpunge(t, trash)
+	if _, err := store.Get(ctx, "inbound/one"); !errors.Is(err, blob.ErrNotFound) {
+		t.Fatalf("source not deleted: %v", err)
+	}
+	restarted, err := New(ctx, store, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = restarted.SyncInbound(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	inbox, _ = restarted.Open("INBOX")
+	if len(inbox.Messages()) != 0 || len(restarted.deletes) != 0 {
+		t.Fatal("deleted mail resurrected or queue not cleared")
+	}
+}
+func TestTrashDeletionWaitsForLiveS3Reference(t *testing.T) {
+	store := &deleteStore{Mem: blob.NewMem()}
+	e, inbox, trash := trashFixture(t, store, t.TempDir())
+	flagAndExpunge(t, trash)
+	if store.deletes != 0 || len(e.deletes) != 1 {
+		t.Fatal("live INBOX reference must defer deletion")
+	}
+	msg := inbox.Messages()[0]
+	if _, err := e.Body(context.Background(), msg.Loc, msg.Key); err != nil {
+		t.Fatal(err)
+	}
+	flagAndExpunge(t, inbox)
+	if store.deletes != 1 || len(e.deletes) != 0 {
+		t.Fatal("deferred deletion not drained after last reference removed")
+	}
+}
+func TestTrashDeleteRetriesAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	store := &deleteStore{Mem: blob.NewMem(), failDelete: true}
+	dir := t.TempDir()
+	_, inbox, trash := trashFixture(t, store, dir)
+	flagAndExpunge(t, inbox)
+	flagAndExpunge(t, trash)
+	restarted, err := New(ctx, store, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(restarted.deletes) != 1 {
+		t.Fatal("delete intent was not durable")
+	}
+	store.failDelete = false
+	if err = restarted.SyncInbound(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if len(restarted.deletes) != 0 || store.deletes != 2 {
+		t.Fatal("retry did not acknowledge delete")
+	}
+	if _, err = store.Get(ctx, "inbound/one"); !errors.Is(err, blob.ErrNotFound) {
+		t.Fatal("source still exists")
+	}
+}
+func TestFailedTrashExpungeDoesNotDeleteS3(t *testing.T) {
+	store := &deleteStore{Mem: blob.NewMem()}
+	e, inbox, trash := trashFixture(t, store, t.TempDir())
+	flagAndExpunge(t, inbox)
+	if _, err := trash.Store(imap.UIDSetNum(1), imap.StoreFlagsAdd, []imap.Flag{imap.FlagDeleted}, nil); err != nil {
+		t.Fatal(err)
+	}
+	e.db.Close()
+	if err := trash.Expunge(context.Background(), nil); err == nil {
+		t.Fatal("expected commit failure")
+	}
+	if store.deletes != 0 || len(e.deletes) != 0 || len(trash.Messages()) != 1 {
+		t.Fatal("failed expunge published deletion")
+	}
 }
