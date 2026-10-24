@@ -3,6 +3,7 @@ package mailbox
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"reflect"
@@ -510,5 +511,129 @@ func TestInboundInternalDateUsesReceiptTime(t *testing.T) {
 	inbox, _ := e.Open("INBOX")
 	if !inbox.Messages()[0].Internal.Equal(received) {
 		t.Fatal("sender date replaced receipt time")
+	}
+}
+
+type deleteStore struct {
+	*blob.Mem
+	failDelete bool
+	deletes    int
+}
+
+func (s *deleteStore) Delete(ctx context.Context, key string) error {
+	s.deletes++
+	if s.failDelete {
+		return fmt.Errorf("injected delete failure")
+	}
+	return s.Mem.Delete(ctx, key)
+}
+func trashFixture(t *testing.T, store blob.Store, dir string) (*Engine, *Box, *Box) {
+	t.Helper()
+	ctx := context.Background()
+	if err := store.Put(ctx, "inbound/one", []byte("Subject: hello\r\n\r\nbody")); err != nil {
+		t.Fatal(err)
+	}
+	e, err := New(ctx, store, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = e.SyncInbound(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	inbox, _ := e.Open("INBOX")
+	trash, _ := e.Open("Trash")
+	if _, err = inbox.Copy(ctx, imap.UIDSetNum(1), "Trash"); err != nil {
+		t.Fatal(err)
+	}
+	return e, inbox, trash
+}
+func flagAndExpunge(t *testing.T, b *Box) {
+	t.Helper()
+	if _, err := b.Store(imap.UIDSetNum(1), imap.StoreFlagsAdd, []imap.Flag{imap.FlagDeleted}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Expunge(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+}
+func TestTrashExpungeDeletesSourceAfterMove(t *testing.T) {
+	ctx := context.Background()
+	store := &deleteStore{Mem: blob.NewMem()}
+	dir := t.TempDir()
+	_, inbox, trash := trashFixture(t, store, dir)
+	flagAndExpunge(t, inbox)
+	if store.deletes != 0 {
+		t.Fatal("INBOX expunge deleted S3")
+	}
+	flagAndExpunge(t, trash)
+	if _, err := store.Get(ctx, "inbound/one"); !errors.Is(err, blob.ErrNotFound) {
+		t.Fatalf("source not deleted: %v", err)
+	}
+	restarted, err := New(ctx, store, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = restarted.SyncInbound(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	inbox, _ = restarted.Open("INBOX")
+	if len(inbox.Messages()) != 0 || len(restarted.deletes) != 0 {
+		t.Fatal("deleted mail resurrected or queue not cleared")
+	}
+}
+func TestTrashDeletionWaitsForLiveS3Reference(t *testing.T) {
+	store := &deleteStore{Mem: blob.NewMem()}
+	e, inbox, trash := trashFixture(t, store, t.TempDir())
+	flagAndExpunge(t, trash)
+	if store.deletes != 0 || len(e.deletes) != 1 {
+		t.Fatal("live INBOX reference must defer deletion")
+	}
+	msg := inbox.Messages()[0]
+	if _, err := e.Body(context.Background(), msg.Loc, msg.Key); err != nil {
+		t.Fatal(err)
+	}
+	flagAndExpunge(t, inbox)
+	if store.deletes != 1 || len(e.deletes) != 0 {
+		t.Fatal("deferred deletion not drained after last reference removed")
+	}
+}
+func TestTrashDeleteRetriesAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	store := &deleteStore{Mem: blob.NewMem(), failDelete: true}
+	dir := t.TempDir()
+	_, inbox, trash := trashFixture(t, store, dir)
+	flagAndExpunge(t, inbox)
+	flagAndExpunge(t, trash)
+	restarted, err := New(ctx, store, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(restarted.deletes) != 1 {
+		t.Fatal("delete intent was not durable")
+	}
+	store.failDelete = false
+	if err = restarted.SyncInbound(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if len(restarted.deletes) != 0 || store.deletes != 2 {
+		t.Fatal("retry did not acknowledge delete")
+	}
+	if _, err = store.Get(ctx, "inbound/one"); !errors.Is(err, blob.ErrNotFound) {
+		t.Fatal("source still exists")
+	}
+}
+func TestFailedTrashExpungeDoesNotDeleteS3(t *testing.T) {
+	store := &deleteStore{Mem: blob.NewMem()}
+	e, inbox, trash := trashFixture(t, store, t.TempDir())
+	flagAndExpunge(t, inbox)
+	if _, err := trash.Store(imap.UIDSetNum(1), imap.StoreFlagsAdd, []imap.Flag{imap.FlagDeleted}, nil); err != nil {
+		t.Fatal(err)
+	}
+	e.db.Close()
+	if err := trash.Expunge(context.Background(), nil); err == nil {
+		t.Fatal("expected commit failure")
+	}
+	if store.deletes != 0 || len(e.deletes) != 0 || len(trash.Messages()) != 1 {
+		t.Fatal("failed expunge published deletion")
 	}
 }

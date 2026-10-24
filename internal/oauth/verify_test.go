@@ -88,3 +88,49 @@ func sign(t *testing.T, key *rsa.PrivateKey, kid string, claims jwt.MapClaims) s
 	}
 	return signed
 }
+
+func TestTokenValidationBoundaries(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name              string
+		change            func(jwt.MapClaims)
+		wrongKey, allowed bool
+	}{
+		{name: "valid", allowed: true},
+		{name: "missing expiration", change: func(c jwt.MapClaims) { delete(c, "exp") }},
+		{name: "expired", change: func(c jwt.MapClaims) { c["exp"] = time.Now().Add(-time.Minute).Unix() }},
+		{name: "future not-before", change: func(c jwt.MapClaims) { c["nbf"] = time.Now().Add(time.Minute).Unix() }},
+		{name: "wrong issuer", change: func(c jwt.MapClaims) { c["iss"] = "other" }},
+		{name: "wrong audience", change: func(c jwt.MapClaims) { c["aud"] = "other" }},
+		{name: "wrong signature", wrongKey: true},
+		{name: "wrong identity", change: func(c jwt.MapClaims) { c["preferred_username"] = "other" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			checker, err := New(Config{Issuer: "issuer", Audience: "mail", JWKSURL: "https://unused.example/keys", Allowed: []string{"owner"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			checker.keys = map[string]*rsa.PublicKey{"key": &key.PublicKey}
+			checker.fetched = time.Now()
+			claims := jwt.MapClaims{"iss": "issuer", "aud": "mail", "exp": time.Now().Add(time.Hour).Unix(), "preferred_username": "owner"}
+			if tc.change != nil {
+				tc.change(claims)
+			}
+			signingKey := key
+			if tc.wrongKey {
+				signingKey = other
+			}
+			err = checker.Accept("owner", sign(t, signingKey, "key", claims))
+			if (err == nil) != tc.allowed {
+				t.Fatalf("accepted=%v: %v", err == nil, err)
+			}
+		})
+	}
+}
