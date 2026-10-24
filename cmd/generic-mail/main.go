@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/denislemire/generic-mail/internal/applepush"
 	"github.com/denislemire/generic-mail/internal/blob"
 	"github.com/denislemire/generic-mail/internal/imapd"
 	"github.com/denislemire/generic-mail/internal/mailbox"
@@ -63,6 +64,18 @@ func main() {
 		log.Fatalf("oauth: %v", err)
 	}
 
+	pushClient, err := applepush.New(applepush.Config{
+		Topic: os.Getenv("APPLE_PUSH_TOPIC"), TeamID: os.Getenv("APPLE_PUSH_TEAM_ID"), KeyID: os.Getenv("APPLE_PUSH_KEY_ID"), KeyFile: os.Getenv("APPLE_PUSH_KEY_FILE"),
+	})
+	if err != nil {
+		log.Fatalf("Apple push configuration: %v", err)
+	}
+	if pushClient != nil {
+		worker := &applepush.Worker{Queue: engine, Sender: pushClient}
+		go worker.Run(ctx)
+		log.Printf("Apple Mail push enabled")
+	}
+
 	certificates, err := newCertificateReloader(env("TLS_CERT", "/tls/tls.crt"), env("TLS_KEY", "/tls/tls.key"))
 	if err != nil {
 		log.Fatalf("tls: %v", err)
@@ -72,7 +85,7 @@ func main() {
 
 	imapSrv := imapserver.New(&imapserver.Options{
 		NewSession: func(*imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
-			return (&imapd.Server{Engine: engine, Username: username, Password: password, OAuth: checker}).NewSession(), &imapserver.GreetingData{}, nil
+			return (&imapd.Server{Engine: engine, Username: username, Password: password, OAuth: checker, PushTopic: pushClient.Topic()}).NewSession(), &imapserver.GreetingData{}, nil
 		},
 		TLSConfig:    tlsConfig,
 		InsecureAuth: false,
@@ -95,9 +108,11 @@ func main() {
 
 	interval := 30 * time.Second
 	if v := os.Getenv("SYNC_INTERVAL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			interval = d
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			log.Fatal("SYNC_INTERVAL must be a positive duration")
 		}
+		interval = d
 	}
 	go func() {
 		if err := engine.SyncInbound(ctx, prefix); err != nil {
