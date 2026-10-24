@@ -16,5 +16,7 @@ The chart defaults are generic. A cluster sets the bucket, hostname, role, and i
 
 Retention belongs in S3 configuration. With [S3 Versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/DeletingObjectVersions.html) enabled, the gateway's ordinary `DeleteObject` call creates a delete marker; it does not erase historical versions. Configure noncurrent-version lifecycle rules for the desired recovery window. For enforced retention periods or legal holds, use [S3 Object Lock](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html). Locked versions remain protected even when a delete marker hides the message from normal mailbox access. The gateway never specifies a version ID or requests a retention bypass, and its role does not need `s3:DeleteObjectVersion` or retention-bypass permissions. This chart does not configure bucket versioning, lifecycle, or Object Lock.
 
-Native [Apple Mail push](docs/apple-mail-push.md) can wake sleeping iPhones after
-an Apple-approved Mail topic is provisioned. It is disabled by default.
+Optional [S3 → SQS ingestion](docs/inbound-events.md) reduces bucket polling and
+provides durable arrival notifications. Native [Apple Mail push](docs/apple-mail-push.md)
+can wake sleeping iPhones after an Apple-approved Mail topic is provisioned.
+Both features are independently configured and disabled by default.

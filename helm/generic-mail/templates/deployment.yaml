@@ -84,6 +84,12 @@ spec:
               value: {{ .Values.mailbox.inboundPrefix | quote }}
             - name: S3_REGION
               value: {{ .Values.mailbox.s3Region | quote }}
+            {{- if .Values.inboundEvents.queueURL }}
+            - name: SQS_QUEUE_URL
+              value: {{ .Values.inboundEvents.queueURL | quote }}
+            - name: SQS_REGION
+              value: {{ .Values.inboundEvents.region | default .Values.mailbox.s3Region | quote }}
+            {{- end }}
             - name: SES_REGION
               value: {{ .Values.mailbox.sesRegion | quote }}
             {{- if .Values.persistence.enabled }}
