@@ -2,8 +2,8 @@ apiVersion: v2
 name: generic-mail
 description: IMAP mailbox over an object store, with authenticated SMTP submission
 type: application
-version: 0.3.0
-appVersion: "0.3.0-ehws-1"
+version: 0.4.0
+appVersion: "0.4.0-ehws-1"
 keywords:
   - imap
   - smtp
