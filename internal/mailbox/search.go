@@ -134,3 +134,89 @@ func bodyOnly(raw []byte) []byte {
 	}
 	return raw
 }
+
+// MatchMetadata evaluates the boolean expression without content I/O. An
+// unknown result means exact matching needs MIME bytes. In particular OR with
+// an already true metadata arm and NOT of a known arm remain I/O-free.
+func MatchMetadata(msg Msg, seq uint32, c *imap.SearchCriteria) (matched, known bool) {
+	if c == nil {
+		return true, true
+	}
+	metadata := *c
+	metadata.Header = nil
+	metadata.Body = nil
+	metadata.Text = nil
+	metadata.SentSince = time.Time{}
+	metadata.SentBefore = time.Time{}
+	metadata.Not = nil
+	metadata.Or = nil
+	if !Match(msg, nil, seq, &metadata) {
+		return false, true
+	}
+	known = len(c.Header) == 0 && len(c.Body) == 0 && len(c.Text) == 0 && c.SentSince.IsZero() && c.SentBefore.IsZero()
+	for _, child := range c.Not {
+		m, k := MatchMetadata(msg, seq, &child)
+		if k && m {
+			return false, true
+		}
+		known = known && k
+	}
+	for _, arms := range c.Or {
+		a, ak := MatchMetadata(msg, seq, &arms[0])
+		b, bk := MatchMetadata(msg, seq, &arms[1])
+		if (ak && a) || (bk && b) {
+			continue
+		}
+		if ak && bk {
+			return false, true
+		}
+		known = false
+	}
+	return true, known
+}
+
+// SearchIndexQuery builds only necessary positive substring conditions. NOT
+// and unindexable terms remain unrestricted. OR can narrow candidates only if
+// both branches can be indexed. Exact IMAP matching always follows the index.
+func SearchIndexQuery(c *imap.SearchCriteria) string {
+	if c == nil {
+		return ""
+	}
+	var parts []string
+	term := func(v string) string {
+		if len(v) < 3 {
+			return ""
+		}
+		for _, r := range v {
+			if r < 32 || r > 126 {
+				return ""
+			}
+		}
+		return `"` + strings.ReplaceAll(strings.ToLower(v), `"`, `""`) + `"`
+	}
+	for _, v := range c.Body {
+		if q := term(v); q != "" {
+			parts = append(parts, q)
+		}
+	}
+	for _, v := range c.Text {
+		if q := term(v); q != "" {
+			parts = append(parts, q)
+		}
+	}
+	for _, h := range c.Header {
+		if q := term(h.Value); q != "" {
+			parts = append(parts, q)
+		}
+	}
+	for _, arms := range c.Or {
+		a, b := SearchIndexQuery(&arms[0]), SearchIndexQuery(&arms[1])
+		if a != "" && b != "" {
+			parts = append(parts, "("+a+" OR "+b+")")
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "(" + strings.Join(parts, " AND ") + ")"
+}

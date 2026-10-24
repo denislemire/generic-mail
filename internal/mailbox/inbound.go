@@ -34,7 +34,12 @@ func (e *Engine) SyncInboundKey(ctx context.Context, key string, when time.Time)
 		when = time.Now()
 	}
 	e.mu.Lock()
-	defer e.mu.Unlock()
+	defer func() {
+		e.mu.Unlock()
+		if raw != nil {
+			e.cacheContent(ctx, locS3, key, raw)
+		}
+	}()
 	err := e.mutateLocked(func() error {
 		if _, exists := e.seen[key]; exists {
 			return nil

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -47,10 +48,15 @@ func main() {
 	if err != nil {
 		log.Fatalf("s3: %v", err)
 	}
-	engine, err := mailbox.New(ctx, store, dataDir)
+	cacheBytes, err := strconv.ParseInt(env("MAIL_DISK_CACHE_BYTES", "536870912"), 10, 64)
+	if err != nil || cacheBytes < 0 {
+		log.Fatal("MAIL_DISK_CACHE_BYTES must be a non-negative integer")
+	}
+	engine, err := mailbox.New(ctx, store, dataDir, mailbox.Options{DiskCacheBytes: cacheBytes})
 	if err != nil {
 		log.Fatalf("mailbox: %v", err)
 	}
+	go engine.WarmContent(ctx)
 	sesClient, err := sesmail.New(ctx, sesRegion)
 	if err != nil {
 		log.Fatalf("ses: %v", err)
@@ -172,6 +178,7 @@ func serveSMTP(srv *smtpd.Server, addr string, tlsConfig *tls.Config, implicit b
 
 func serveHealth(engine *mailbox.Engine, addr string) error {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) { writeContentMetrics(w, engine.ContentStats()) })
 	mux.HandleFunc("/livez", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))

@@ -23,9 +23,11 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/denislemire/generic-mail/internal/blob"
+	"github.com/denislemire/generic-mail/internal/localcache"
 	"github.com/denislemire/generic-mail/internal/state"
 
 	"github.com/emersion/go-imap/v2"
@@ -46,8 +48,13 @@ const (
 
 // Engine is safe for concurrent IMAP sessions and one sync loop.
 type Engine struct {
-	blobs blob.Store
+	blobs      blob.Store
+	memoryHits atomic.Uint64
+	diskHits   atomic.Uint64
+	s3Reads    atomic.Uint64
 
+	bodyLoads   [32]sync.Mutex
+	disk        *localcache.Cache
 	deleteMu    sync.Mutex
 	mu          sync.Mutex
 	db          *state.DB
@@ -108,10 +115,20 @@ type fileMsg struct {
 	Owned    bool      `json:"owned,omitempty"`
 }
 
+type Options struct{ DiskCacheBytes int64 }
+
 // New opens the local index under dataDir and ensures the four mailboxes exist.
 // An empty database imports imap-state/mailboxes.json once, if that object exists,
-// and does not write it back.
-func New(ctx context.Context, store blob.Store, dataDir string) (*Engine, error) {
+// and does not write it back. With no options the disk cache is 512 MiB.
+func New(ctx context.Context, store blob.Store, dataDir string, options ...Options) (*Engine, error) {
+	budget := int64(512 << 20)
+	if len(options) > 0 {
+		budget = options[0].DiskCacheBytes
+	}
+	disk, err := localcache.Open(filepath.Join(dataDir, "cache", "s3"), budget)
+	if err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(filepath.Join(dataDir, "files"), 0o750); err != nil {
 		return nil, err
 	}
@@ -121,6 +138,7 @@ func New(ctx context.Context, store blob.Store, dataDir string) (*Engine, error)
 	}
 	e := &Engine{
 		blobs:       store,
+		disk:        disk,
 		db:          db,
 		files:       filepath.Join(dataDir, "files"),
 		boxes:       map[string]*box{},
@@ -257,7 +275,12 @@ func (e *Engine) SyncInbound(ctx context.Context, prefix string) error {
 			return nil
 		}
 		e.mu.Lock()
-		defer e.mu.Unlock()
+		defer func(items []fresh) {
+			e.mu.Unlock()
+			for _, item := range items {
+				e.cacheContent(ctx, locS3, item.key, item.raw)
+			}
+		}(added)
 		count := 0
 		err := e.mutateLocked(func() error {
 			for _, key := range skipped {
@@ -582,31 +605,6 @@ func (e *Engine) snapshotLocked() state.Snap {
 	return snap
 }
 
-// Body returns the RFC822 bytes for an index location.
-func (e *Engine) Body(ctx context.Context, loc, key string) ([]byte, error) {
-	ck := loc + "\n" + key
-	e.mu.Lock()
-	if raw, ok := e.cache[ck]; ok {
-		e.mu.Unlock()
-		return append([]byte(nil), raw...), nil
-	}
-	e.mu.Unlock()
-	var raw []byte
-	var err error
-	if loc == locFile {
-		raw, err = os.ReadFile(filepath.Join(e.files, key))
-	} else {
-		raw, err = e.blobs.Get(ctx, key)
-	}
-	if err != nil {
-		return nil, err
-	}
-	e.mu.Lock()
-	e.rememberLocked(loc, key, raw)
-	e.mu.Unlock()
-	return raw, nil
-}
-
 func (e *Engine) rememberLocked(loc, key string, raw []byte) {
 	key = loc + "\n" + key
 	budget := e.cacheBudget
@@ -810,7 +808,7 @@ func (b *Box) Append(ctx context.Context, r io.Reader, opts *imap.AppendOptions)
 		flags = opts.Flags
 	}
 	b.e.mu.Lock()
-	defer b.e.mu.Unlock()
+	defer func() { b.e.mu.Unlock(); b.e.cacheContent(ctx, locFile, id, raw) }()
 	var data *imap.AppendData
 	err = b.e.mutateLocked(func() error {
 		bx := b.box()
@@ -1463,6 +1461,13 @@ func (e *Engine) retryDeletes(ctx context.Context) {
 			log.Printf("S3 delete pending for %q: %v", key, err)
 			continue
 		}
+		load := e.bodyLoadLock(locS3, key)
+		load.Lock()
+		if cacheErr := e.disk.Delete(locS3 + "\n" + key); cacheErr != nil {
+			log.Printf("local body cache cleanup pending")
+			load.Unlock()
+			continue
+		}
 		e.mu.Lock()
 		err := e.mutateLocked(func() error { delete(e.deletes, key); return nil })
 		if err == nil {
@@ -1471,6 +1476,7 @@ func (e *Engine) retryDeletes(ctx context.Context) {
 			delete(e.cache, ck)
 		}
 		e.mu.Unlock()
+		load.Unlock()
 		if err != nil {
 			log.Printf("S3 delete acknowledgement pending for %q: %v", key, err)
 		}
