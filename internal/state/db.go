@@ -55,7 +55,7 @@ func Open(path string) (*DB, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(schema); err != nil {
+	if _, err := db.Exec(schema + pushSchema); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -196,6 +196,11 @@ func (d *DB) Save(snap Snap) error {
 	}
 	for _, b := range snap.Boxes {
 		old, exists := oldBoxes[b.Name]
+		if !reflect.DeepEqual(old.Messages, b.Messages) {
+			if err = enqueuePush(tx, b.Name); err != nil {
+				return err
+			}
+		}
 		if !exists || old.UIDValidity != b.UIDValidity || old.UIDNext != b.UIDNext || old.Subscribed != b.Subscribed {
 			if _, err = tx.Exec(`INSERT INTO mailbox (name,uid_validity,uid_next,subscribed) VALUES (?,?,?,?)
     ON CONFLICT(name) DO UPDATE SET uid_validity=excluded.uid_validity,uid_next=excluded.uid_next,subscribed=excluded.subscribed`, b.Name, b.UIDValidity, b.UIDNext, b.Subscribed); err != nil {
@@ -229,6 +234,9 @@ func (d *DB) Save(snap Snap) error {
 		delete(oldBoxes, b.Name)
 	}
 	for name := range oldBoxes {
+		if err = enqueuePush(tx, name); err != nil {
+			return err
+		}
 		if _, err = tx.Exec(`DELETE FROM message WHERE mailbox=?`, name); err != nil {
 			return err
 		}

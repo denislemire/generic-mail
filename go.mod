@@ -7,11 +7,14 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.31.12
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.88.1
 	github.com/aws/aws-sdk-go-v2/service/sesv2 v1.49.0
+	github.com/aws/aws-sdk-go-v2/service/sqs v1.38.0
 	github.com/aws/smithy-go v1.23.0
 	github.com/emersion/go-imap/v2 v2.0.0-beta.8
 	github.com/emersion/go-message v0.18.2
 	github.com/emersion/go-sasl v0.0.0-20241020182733-b788ff22d5a6
 	github.com/emersion/go-smtp v0.24.0
+	github.com/golang-jwt/jwt/v5 v5.2.2
+	modernc.org/sqlite v1.38.2
 )
 
 require (
@@ -30,7 +33,6 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.35.1 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.38.6 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
-	github.com/golang-jwt/jwt/v5 v5.2.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/ncruces/go-strftime v0.1.9 // indirect
@@ -40,5 +42,6 @@ require (
 	modernc.org/libc v1.66.3 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
-	modernc.org/sqlite v1.38.2 // indirect
 )
+
+replace github.com/emersion/go-imap/v2 => github.com/denislemire/go-imap/v2 v2.0.0-beta.8.0.20261024012418-6f41b4aefe26

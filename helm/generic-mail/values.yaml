@@ -13,7 +13,7 @@ mailbox:
   inboundPrefix: inbound/
   s3Region: us-east-1
   sesRegion: ca-central-1
-  syncInterval: 30s
+  syncInterval: "" # Defaults to 30s, or 5m with inboundEvents.queueURL set.
   # Extra envelope senders; the login address is always permitted.
   allowedFrom: []
   allowedFromDomains: []
@@ -81,3 +81,17 @@ resources:
   limits:
     cpu: "1"
     memory: 256Mi
+
+# Native iPhone Mail push requires an Apple-approved Mail APNs topic.
+# Disabled until the topic and .p8 credentials have been provisioned.
+applePush:
+  enabled: false
+  topic: ""
+  teamID: ""
+  keyID: ""
+  existingSecret: "" # Secret key: private-key.p8
+
+# Direct S3 ObjectCreated notifications; independent of Apple Mail push.
+inboundEvents:
+  queueURL: ""
+  region: "" # Defaults to mailbox.s3Region.

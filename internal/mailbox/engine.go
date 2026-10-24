@@ -1,6 +1,6 @@
 // Package mailbox is the interim Generic mailbox.
 //
-// SES inbound objects stay immutable in S3. UIDs, flags, and folders live in a
+// SES inbound objects remain in S3 until expunged from Trash. UIDs, flags, and folders live in a
 // local SQLite file. Copying a message into a folder writes a local file and
 // points the index at that file. UIDValidity is fixed for the life of the
 // database: if the volume is lost, clients must resync.
@@ -268,10 +268,7 @@ func (e *Engine) SyncInbound(ctx context.Context, prefix string) error {
 				if _, exists := e.seen[item.key]; exists {
 					continue
 				}
-				msg := &message{uid: inbox.uidNext, loc: locS3, key: item.key, source: item.key, size: int64(len(item.raw)), internal: item.internal, flags: map[imap.Flag]struct{}{}}
-				inbox.uidNext++
-				inbox.msgs = append(inbox.msgs, msg)
-				e.seen[item.key] = struct{}{}
+				e.addInboundLocked(item.key, item.raw, item.internal)
 				count++
 			}
 			if count > 0 {

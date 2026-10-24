@@ -6,7 +6,9 @@ import (
 	"context"
 	"crypto/subtle"
 	"strings"
+	"time"
 
+	"github.com/denislemire/generic-mail/internal/applepush"
 	"github.com/denislemire/generic-mail/internal/mailbox"
 	"github.com/denislemire/generic-mail/internal/oauth"
 
@@ -18,10 +20,11 @@ import (
 
 // Server serves one mailbox over IMAP.
 type Server struct {
-	Engine   *mailbox.Engine
-	Username string
-	Password string
-	OAuth    *oauth.Checker
+	Engine    *mailbox.Engine
+	Username  string
+	Password  string
+	OAuth     *oauth.Checker
+	PushTopic string
 }
 
 func (s *Server) NewSession() imapserver.Session {
@@ -429,4 +432,30 @@ func writeFetch(w *imapserver.FetchResponseWriter, msg mailbox.Msg, raw []byte, 
 // Metadata operations must not depend on S3 or local body availability.
 func fetchNeedsBody(options *imap.FetchOptions) bool {
 	return options.Envelope || options.BodyStructure != nil || len(options.BodySection) > 0
+}
+
+// ApplePushTopic is empty until Mail-specific APNs credentials are configured.
+func (s *session) ApplePushTopic() string {
+	if !s.authed {
+		return ""
+	}
+	return s.srv.PushTopic
+}
+func (s *session) RegisterApplePush(registration *imapserver.ApplePushRegistration) error {
+	if err := s.needAuth(); err != nil {
+		return err
+	}
+	if s.srv.PushTopic == "" {
+		return no("Apple push is not enabled")
+	}
+	if registration == nil {
+		return no("invalid Apple push registration")
+	}
+	token, names, err := applepush.NormalizeRegistration(registration.AccountID, registration.DeviceToken, registration.Subtopic, registration.Mailboxes)
+	if err != nil {
+		return no("invalid Apple push registration")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return s.srv.Engine.RegisterPush(ctx, registration.AccountID, token, names)
 }
