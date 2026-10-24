@@ -18,6 +18,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -240,77 +241,102 @@ func (e *Engine) SyncInbound(ctx context.Context, prefix string) error {
 		raw      []byte
 		internal time.Time
 	}
+	// Bound retained bodies independently of the process cache. A batch may
+	// contain one large message, but never the entire inbound backlog.
+	const batchBytes = 8 << 20
+	const batchCount = 64
 	var added []fresh
-	var skipMore []string
-	for _, meta := range metas {
-		if _, ok := known[meta.Key]; ok {
-			continue
+	var skipped []string
+	retained, n := 0, 0
+	flush := func() error {
+		if len(added) == 0 && len(skipped) == 0 {
+			return nil
 		}
-		raw, err := e.blobs.Get(ctx, meta.Key)
-		if err != nil {
-			if errors.Is(err, blob.ErrNotFound) {
-				continue
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		count := 0
+		err := e.mutateLocked(func() error {
+			for _, key := range skipped {
+				e.seen[key] = struct{}{}
 			}
+			inbox := e.boxes[BoxINBOX]
+			for _, item := range added {
+				if _, exists := e.seen[item.key]; exists {
+					continue
+				}
+				msg := &message{uid: inbox.uidNext, loc: locS3, key: item.key, source: item.key, size: int64(len(item.raw)), internal: item.internal, flags: map[imap.Flag]struct{}{}}
+				inbox.uidNext++
+				inbox.msgs = append(inbox.msgs, msg)
+				e.seen[item.key] = struct{}{}
+				count++
+			}
+			if count > 0 {
+				e.queueCount(inbox)
+			}
+			return nil
+		})
+		if err != nil {
 			return err
 		}
-		if isSetupNotice(raw) {
-			skipMore = append(skipMore, meta.Key)
+		for _, item := range added {
+			e.rememberLocked(locS3, item.key, item.raw)
+		}
+		n += count
+		added = nil
+		skipped = nil
+		retained = 0
+		return nil
+	}
+	for _, meta := range metas {
+		if _, exists := known[meta.Key]; exists {
 			continue
 		}
-		when := meta.LastModified
-		if when.IsZero() {
-			when = time.Now().UTC()
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		if parsed := headerDate(raw); !parsed.IsZero() {
-			when = parsed
+		if isSetupNotice(meta.Key) {
+			skipped = append(skipped, meta.Key)
+		} else {
+			raw, err := e.blobs.Get(ctx, meta.Key)
+			if err != nil {
+				// Preserve already downloaded progress before reporting a later failure.
+				if saveErr := flush(); saveErr != nil {
+					return saveErr
+				}
+				if errors.Is(err, blob.ErrNotFound) {
+					continue
+				}
+				return err
+			}
+			when := meta.LastModified
+			if when.IsZero() {
+				when = time.Now().UTC()
+			}
+			added = append(added, fresh{key: meta.Key, raw: raw, internal: when.UTC()})
+			retained += len(raw)
 		}
-		added = append(added, fresh{key: meta.Key, raw: raw, internal: when.UTC()})
+		if retained >= batchBytes || len(added)+len(skipped) >= batchCount {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
 	}
-
-	e.mu.Lock()
-	n := 0
-	err = e.mutateLocked(func() error {
-		for _, key := range skipMore {
-			e.seen[key] = struct{}{}
-		}
-		inbox := e.boxes[BoxINBOX]
-		for _, item := range added {
-			if _, ok := e.seen[item.key]; ok {
-				continue
-			}
-			msg := &message{
-				uid:      inbox.uidNext,
-				loc:      locS3,
-				key:      item.key,
-				source:   item.key,
-				size:     int64(len(item.raw)),
-				internal: item.internal,
-				flags:    map[imap.Flag]struct{}{},
-			}
-			inbox.uidNext++
-			inbox.msgs = append(inbox.msgs, msg)
-			e.seen[item.key] = struct{}{}
-			e.rememberLocked(locS3, item.key, item.raw)
-			n++
-		}
-		if n > 0 || len(skipMore) > 0 {
-			e.queueCount(inbox)
-		}
-		e.ready = true
-		return nil
-	})
-	e.mu.Unlock()
-	if err != nil {
+	if err := flush(); err != nil {
 		return err
 	}
+	e.mu.Lock()
+	e.ready = true
+	e.mu.Unlock()
 	if n > 0 {
 		log.Printf("inbound sync: %d new message(s)", n)
 	}
 	return nil
 }
 
-func isSetupNotice(raw []byte) bool {
-	return bytes.Contains(bytes.ToLower(raw), []byte("amazon_ses_setup_notification"))
+// SES uses a reserved object name for its receipt-rule setup probe. Message
+// contents must never decide whether an ordinary object is hidden.
+func isSetupNotice(key string) bool {
+	return strings.EqualFold(path.Base(key), "AMAZON_SES_SETUP_NOTIFICATION")
 }
 
 func headerDate(raw []byte) time.Time {

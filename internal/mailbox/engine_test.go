@@ -3,6 +3,7 @@ package mailbox
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"reflect"
 	"testing"
@@ -419,5 +420,95 @@ func TestFailedMutationsAreInvisible(t *testing.T) {
 				t.Fatal("failed mutation changed tracker count")
 			}
 		})
+	}
+}
+
+type progressStore struct {
+	*blob.Mem
+	engine    *Engine
+	reads     int
+	failAfter int
+}
+
+func (s *progressStore) Get(ctx context.Context, key string) ([]byte, error) {
+	s.reads++
+	if s.reads == 65 {
+		inbox, _ := s.engine.Open("INBOX")
+		if len(inbox.Messages()) < 64 {
+			return nil, fmt.Errorf("sync retained first batch without committing")
+		}
+	}
+	if s.failAfter > 0 && s.reads > s.failAfter {
+		return nil, fmt.Errorf("injected S3 failure")
+	}
+	return s.Mem.Get(ctx, key)
+}
+func TestSyncPersistsBoundedBatchesAndRetries(t *testing.T) {
+	ctx := context.Background()
+	store := &progressStore{Mem: blob.NewMem(), failAfter: 70}
+	dir := t.TempDir()
+	e, err := New(ctx, store, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.engine = e
+	for i := 0; i < 130; i++ {
+		store.PutMeta(fmt.Sprintf("inbound/%03d", i), []byte("Subject: hello\r\n\r\nbody"), time.Now())
+	}
+	if err = e.SyncInbound(ctx, ""); err == nil {
+		t.Fatal("expected download failure")
+	}
+	if e.Ready() {
+		t.Fatal("partial initial sync must not be ready")
+	}
+	restarted, err := New(ctx, store, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inbox, _ := restarted.Open("INBOX")
+	if len(inbox.Messages()) != 70 {
+		t.Fatalf("progress not durable: %d", len(inbox.Messages()))
+	}
+	store.engine = restarted
+	store.failAfter = 0
+	if err = restarted.SyncInbound(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if len(inbox.Messages()) != 130 || !restarted.Ready() {
+		t.Fatal("retry duplicated or lost messages")
+	}
+}
+func TestSetupNoticeUsesObjectName(t *testing.T) {
+	ctx := context.Background()
+	store := blob.NewMem()
+	e, err := New(ctx, store, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.PutMeta("inbound/normal", []byte("Subject: support\r\n\r\nPlease explain amazon_ses_setup_notification"), time.Now())
+	store.PutMeta("inbound/AMAZON_SES_SETUP_NOTIFICATION", []byte("setup probe"), time.Now())
+	if err = e.SyncInbound(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	inbox, _ := e.Open("INBOX")
+	if len(inbox.Messages()) != 1 || inbox.Messages()[0].Key != "inbound/normal" {
+		t.Fatalf("wrong objects imported: %+v", inbox.Messages())
+	}
+}
+func TestInboundInternalDateUsesReceiptTime(t *testing.T) {
+	ctx := context.Background()
+	store := blob.NewMem()
+	e, err := New(ctx, store, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	received := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
+	store.PutMeta("inbound/one", []byte("Date: Thu, 01 Jan 1970 00:00:00 +0000\r\n\r\nbody"), received)
+	if err = e.SyncInbound(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	inbox, _ := e.Open("INBOX")
+	if !inbox.Messages()[0].Internal.Equal(received) {
+		t.Fatal("sender date replaced receipt time")
 	}
 }
