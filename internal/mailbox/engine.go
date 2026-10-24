@@ -48,7 +48,6 @@ type Engine struct {
 	blobs blob.Store
 
 	mu          sync.Mutex
-	commitMu    sync.Mutex
 	db          *state.DB
 	files       string
 	boxes       map[string]*box
@@ -57,6 +56,7 @@ type Engine struct {
 	cache       map[string][]byte
 	cacheN      int
 	cacheBudget int
+	pending     []func()
 }
 
 const (
@@ -268,40 +268,40 @@ func (e *Engine) SyncInbound(ctx context.Context, prefix string) error {
 	}
 
 	e.mu.Lock()
-	for _, key := range skipMore {
-		e.seen[key] = struct{}{}
-	}
-	inbox := e.boxes[BoxINBOX]
 	n := 0
-	for _, item := range added {
-		if _, ok := e.seen[item.key]; ok {
-			continue
+	err = e.mutateLocked(func() error {
+		for _, key := range skipMore {
+			e.seen[key] = struct{}{}
 		}
-		msg := &message{
-			uid:      inbox.uidNext,
-			loc:      locS3,
-			key:      item.key,
-			source:   item.key,
-			size:     int64(len(item.raw)),
-			internal: item.internal,
-			flags:    map[imap.Flag]struct{}{},
+		inbox := e.boxes[BoxINBOX]
+		for _, item := range added {
+			if _, ok := e.seen[item.key]; ok {
+				continue
+			}
+			msg := &message{
+				uid:      inbox.uidNext,
+				loc:      locS3,
+				key:      item.key,
+				source:   item.key,
+				size:     int64(len(item.raw)),
+				internal: item.internal,
+				flags:    map[imap.Flag]struct{}{},
+			}
+			inbox.uidNext++
+			inbox.msgs = append(inbox.msgs, msg)
+			e.seen[item.key] = struct{}{}
+			e.rememberLocked(locS3, item.key, item.raw)
+			n++
 		}
-		inbox.uidNext++
-		inbox.msgs = append(inbox.msgs, msg)
-		e.seen[item.key] = struct{}{}
-		e.rememberLocked(locS3, item.key, item.raw)
-		n++
-	}
-	if n > 0 || len(skipMore) > 0 {
-		inbox.tracker.QueueNumMessages(uint32(len(inbox.msgs)))
-	}
-	e.ready = true
+		if n > 0 || len(skipMore) > 0 {
+			e.queueCount(inbox)
+		}
+		e.ready = true
+		return nil
+	})
 	e.mu.Unlock()
-
-	if n > 0 || len(skipMore) > 0 {
-		if err := e.commit(ctx); err != nil {
-			return err
-		}
+	if err != nil {
+		return err
 	}
 	if n > 0 {
 		log.Printf("inbound sync: %d new message(s)", n)
@@ -445,12 +445,63 @@ func (e *Engine) loadDB() error {
 }
 
 func (e *Engine) commit(_ context.Context) error {
-	e.commitMu.Lock()
-	defer e.commitMu.Unlock()
 	e.mu.Lock()
-	snap := e.snapshotLocked()
-	e.mu.Unlock()
-	return e.db.Save(snap)
+	defer e.mu.Unlock()
+	return e.db.Save(e.snapshotLocked())
+}
+
+// mutateLocked keeps failed writes invisible and publishes tracker updates only
+// after SQLite commits. The caller holds mu throughout mutation and persistence.
+func (e *Engine) mutateLocked(change func() error) error {
+	original := make(map[string]*box, len(e.boxes))
+	saved := make(map[*box]box, len(e.boxes))
+	for name, b := range e.boxes {
+		original[name] = b
+		copyBox := *b
+		copyBox.msgs = make([]*message, len(b.msgs))
+		for i, m := range b.msgs {
+			copyMsg := *m
+			copyMsg.flags = copyFlags(m.flags)
+			copyBox.msgs[i] = &copyMsg
+		}
+		saved[b] = copyBox
+	}
+	seen := make(map[string]struct{}, len(e.seen))
+	for key := range e.seen {
+		seen[key] = struct{}{}
+	}
+	ready := e.ready
+	e.pending = nil
+	err := change()
+	if err == nil {
+		err = e.db.Save(e.snapshotLocked())
+	}
+	if err != nil {
+		for b, copyBox := range saved {
+			*b = copyBox
+		}
+		e.boxes, e.seen, e.ready = original, seen, ready
+	} else {
+		for _, notify := range e.pending {
+			notify()
+		}
+	}
+	e.pending = nil
+	return err
+}
+
+func (e *Engine) queueCount(b *box) {
+	n := uint32(len(b.msgs))
+	e.pending = append(e.pending, func() { b.tracker.QueueNumMessages(n) })
+}
+
+func (e *Engine) queueFlags(b *box, seq uint32, m *message, source *imapserver.SessionTracker) {
+	uid, flags := m.uid, flagList(m.flags)
+	e.pending = append(e.pending, func() { b.tracker.QueueMessageFlags(seq, uid, flags, source) })
+}
+
+func (e *Engine) queueExpunge(b *box, seq uint32) {
+	e.pending = append(e.pending, func() { b.tracker.QueueExpunge(seq) })
 }
 
 func (e *Engine) snapshotLocked() state.Snap {
@@ -549,7 +600,7 @@ type Box struct {
 	target *box
 }
 
-// Commit writes the UID and flag state back to the blob store.
+// Commit persists the current UID and flag state to SQLite.
 func (e *Engine) Commit(ctx context.Context) error { return e.commit(ctx) }
 
 // Open returns a mailbox by name.
@@ -720,33 +771,29 @@ func (b *Box) Append(ctx context.Context, r io.Reader, opts *imap.AppendOptions)
 		flags = opts.Flags
 	}
 	b.e.mu.Lock()
-	bx := b.box()
-	if b.e.boxes[bx.name] != bx {
-		b.e.mu.Unlock()
-		return nil, errNo("no such mailbox")
-	}
-	msg := &message{
-		uid:      bx.uidNext,
-		loc:      locFile,
-		key:      id,
-		size:     int64(len(raw)),
-		internal: when,
-		flags:    map[imap.Flag]struct{}{},
-	}
-	for _, f := range flags {
-		msg.flags[canonicalFlag(f)] = struct{}{}
-	}
-	bx.uidNext++
-	bx.msgs = append(bx.msgs, msg)
-	uid := msg.uid
-	valid := bx.uidValid
-	bx.tracker.QueueNumMessages(uint32(len(bx.msgs)))
-	b.e.rememberLocked(locFile, id, raw)
-	b.e.mu.Unlock()
-	if err := b.e.commit(ctx); err != nil {
+	defer b.e.mu.Unlock()
+	var data *imap.AppendData
+	err = b.e.mutateLocked(func() error {
+		bx := b.box()
+		if b.e.boxes[bx.name] != bx {
+			return errNo("no such mailbox")
+		}
+		msg := &message{uid: bx.uidNext, loc: locFile, key: id, size: int64(len(raw)), internal: when, flags: map[imap.Flag]struct{}{}}
+		for _, f := range flags {
+			msg.flags[canonicalFlag(f)] = struct{}{}
+		}
+		bx.uidNext++
+		bx.msgs = append(bx.msgs, msg)
+		b.e.queueCount(bx)
+		data = &imap.AppendData{UID: msg.uid, UIDValidity: bx.uidValid}
+		return nil
+	})
+	if err != nil {
+		_ = os.Remove(filepath.Join(b.e.files, id))
 		return nil, err
 	}
-	return &imap.AppendData{UID: uid, UIDValidity: valid}, nil
+	b.e.rememberLocked(locFile, id, raw)
+	return data, nil
 }
 
 func (e *Engine) writeFile(raw []byte) (string, error) {
@@ -785,6 +832,12 @@ func (b *Box) ForEach(numSet imap.NumSet, fn func(Msg), views ...*imapserver.Ses
 		if !containsView(numSet, seq, m.uid, view) {
 			continue
 		}
+		if view != nil {
+			seq = view.EncodeSeqNum(seq)
+		}
+		if seq == 0 {
+			continue
+		}
 		matched = append(matched, Msg{
 			Seq:      seq,
 			UID:      m.uid,
@@ -802,96 +855,118 @@ func (b *Box) ForEach(numSet imap.NumSet, fn func(Msg), views ...*imapserver.Ses
 }
 
 // SetSeen marks messages that were fetched without PEEK.
-func (b *Box) SetSeen(uids []imap.UID) {
+func (b *Box) SetSeen(uids []imap.UID) error {
 	if len(uids) == 0 {
-		return
+		return nil
 	}
 	want := map[imap.UID]struct{}{}
-	for _, u := range uids {
-		want[u] = struct{}{}
+	for _, uid := range uids {
+		want[uid] = struct{}{}
 	}
-	b.e.mu.Lock()
-	bx := b.box()
-	seen := canonicalFlag(imap.FlagSeen)
-	for i, m := range bx.msgs {
-		if _, ok := want[m.uid]; !ok {
-			continue
-		}
-		if _, ok := m.flags[seen]; ok {
-			continue
-		}
-		m.flags[seen] = struct{}{}
-		bx.tracker.QueueMessageFlags(uint32(i+1), m.uid, flagList(m.flags), nil)
-	}
-	b.e.mu.Unlock()
-}
-
-// Store updates flags. It returns the messages that changed, for a non-silent FETCH.
-func (b *Box) Store(numSet imap.NumSet, op imap.StoreFlagsOp, flags []imap.Flag, session *imapserver.SessionTracker) []Msg {
 	b.e.mu.Lock()
 	defer b.e.mu.Unlock()
-	bx := b.box()
-	numSet = staticNumSetView(numSet, bx, session)
-	var changed []Msg
-	for i, m := range bx.msgs {
-		seq := uint32(i + 1)
-		if !containsView(numSet, seq, m.uid, session) {
-			continue
+	return b.e.mutateLocked(func() error {
+		bx := b.box()
+		if b.e.boxes[bx.name] != bx {
+			return errNo("no such mailbox")
 		}
-		applyFlags(m.flags, op, flags)
-		list := flagList(m.flags)
-		bx.tracker.QueueMessageFlags(seq, m.uid, list, session)
-		changed = append(changed, Msg{Seq: seq, UID: m.uid, Loc: m.loc, Key: m.key, Size: m.size, Internal: m.internal, Flags: list})
+		seen := canonicalFlag(imap.FlagSeen)
+		for i, m := range bx.msgs {
+			if _, ok := want[m.uid]; !ok {
+				continue
+			}
+			if _, ok := m.flags[seen]; ok {
+				continue
+			}
+			m.flags[seen] = struct{}{}
+			b.e.queueFlags(bx, uint32(i+1), m, nil)
+		}
+		return nil
+	})
+}
+
+// Store commits flags before returning them or notifying other sessions.
+func (b *Box) Store(numSet imap.NumSet, op imap.StoreFlagsOp, flags []imap.Flag, session *imapserver.SessionTracker) ([]Msg, error) {
+	b.e.mu.Lock()
+	defer b.e.mu.Unlock()
+	var changed []Msg
+	err := b.e.mutateLocked(func() error {
+		bx := b.box()
+		if b.e.boxes[bx.name] != bx {
+			return errNo("no such mailbox")
+		}
+		numSet = staticNumSetView(numSet, bx, session)
+		for i, m := range bx.msgs {
+			seq := uint32(i + 1)
+			if !containsView(numSet, seq, m.uid, session) {
+				continue
+			}
+			applyFlags(m.flags, op, flags)
+			b.e.queueFlags(bx, seq, m, session)
+			if session != nil {
+				seq = session.EncodeSeqNum(seq)
+			}
+			changed = append(changed, Msg{Seq: seq, UID: m.uid, Loc: m.loc, Key: m.key, Size: m.size, Internal: m.internal, Flags: flagList(m.flags)})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	return changed
+	return changed, nil
 }
 
 // Expunge removes \Deleted messages from this mailbox.
 // S3 objects are never deleted. A local file is removed when no row still points at it.
 func (b *Box) Expunge(ctx context.Context, uids *imap.UIDSet) error {
 	b.e.mu.Lock()
-	bx := b.box()
-	del := canonicalFlag(imap.FlagDeleted)
-	var keep []*message
-	var drop []*message
-	for i := len(bx.msgs) - 1; i >= 0; i-- {
-		m := bx.msgs[i]
-		_, flagged := m.flags[del]
-		if flagged && (uids == nil || uids.Contains(m.uid)) {
-			drop = append(drop, m)
-			bx.tracker.QueueExpunge(uint32(i + 1))
-		}
-	}
-	if len(drop) == 0 {
-		b.e.mu.Unlock()
-		return nil
-	}
-	dropSet := map[*message]struct{}{}
-	for _, m := range drop {
-		dropSet[m] = struct{}{}
-	}
-	for _, m := range bx.msgs {
-		if _, ok := dropSet[m]; !ok {
-			keep = append(keep, m)
-		}
-	}
-	bx.msgs = keep
-	for _, m := range drop {
-		if m.loc == locS3 {
-			b.e.seen[m.key] = struct{}{}
-		}
-		if m.source != "" {
-			b.e.seen[m.source] = struct{}{}
-		}
-	}
 	var files []string
-	for _, m := range drop {
-		if m.loc == locFile && !b.e.fileUsedLocked(m.key) {
-			files = append(files, m.key)
+	err := b.e.mutateLocked(func() error {
+		bx := b.box()
+		if b.e.boxes[bx.name] != bx {
+			return errNo("no such mailbox")
 		}
-	}
+		del := canonicalFlag(imap.FlagDeleted)
+		var keep []*message
+		var drop []*message
+		for i := len(bx.msgs) - 1; i >= 0; i-- {
+			m := bx.msgs[i]
+			_, flagged := m.flags[del]
+			if flagged && (uids == nil || uids.Contains(m.uid)) {
+				drop = append(drop, m)
+				b.e.queueExpunge(bx, uint32(i+1))
+			}
+		}
+		if len(drop) == 0 {
+			return nil
+		}
+		dropSet := map[*message]struct{}{}
+		for _, m := range drop {
+			dropSet[m] = struct{}{}
+		}
+		for _, m := range bx.msgs {
+			if _, ok := dropSet[m]; !ok {
+				keep = append(keep, m)
+			}
+		}
+		bx.msgs = keep
+		for _, m := range drop {
+			if m.loc == locS3 {
+				b.e.seen[m.key] = struct{}{}
+			}
+			if m.source != "" {
+				b.e.seen[m.source] = struct{}{}
+			}
+		}
+		for _, m := range drop {
+			if m.loc == locFile && !b.e.fileUsedLocked(m.key) {
+				files = append(files, m.key)
+			}
+		}
+		return nil
+	})
 	b.e.mu.Unlock()
-	if err := b.e.commit(ctx); err != nil {
+	if err != nil {
 		return err
 	}
 	for _, id := range files {
@@ -927,7 +1002,12 @@ func (b *Box) Copy(ctx context.Context, numSet imap.NumSet, destName string, vie
 		b.e.mu.Unlock()
 		return nil, errNo("INBOX only accepts mail delivered by SES")
 	}
+	destination := b.e.boxes[dest]
 	src := b.box()
+	if b.e.boxes[src.name] != src {
+		b.e.mu.Unlock()
+		return nil, errNo("no such mailbox")
+	}
 	numSet = staticNumSetView(numSet, src, view)
 	type item struct {
 		loc, key, source string
@@ -955,7 +1035,7 @@ func (b *Box) Copy(ctx context.Context, numSet imap.NumSet, destName string, vie
 	b.e.mu.Unlock()
 	if len(todo) == 0 {
 		b.e.mu.Lock()
-		valid := b.e.boxes[dest].uidValid
+		valid := destination.uidValid
 		b.e.mu.Unlock()
 		return &imap.CopyData{UIDValidity: valid}, nil
 	}
@@ -965,6 +1045,14 @@ func (b *Box) Copy(ctx context.Context, numSet imap.NumSet, destName string, vie
 		size int64
 	}
 	var wrote []written
+	committed := false
+	defer func() {
+		if !committed {
+			for _, w := range wrote {
+				_ = os.Remove(filepath.Join(b.e.files, w.id))
+			}
+		}
+	}()
 	for _, it := range todo {
 		raw, err := b.e.Body(ctx, it.loc, it.key)
 		if err != nil {
@@ -977,38 +1065,40 @@ func (b *Box) Copy(ctx context.Context, numSet imap.NumSet, destName string, vie
 		wrote = append(wrote, written{item: it, id: id, size: int64(len(raw))})
 	}
 	b.e.mu.Lock()
-	dst := b.e.boxes[dest]
-	if dst == nil {
-		b.e.mu.Unlock()
-		return nil, errNo("no such mailbox")
-	}
+	defer b.e.mu.Unlock()
+	dst := destination
 	var dstUIDs imap.UIDSet
-	for _, w := range wrote {
-		flags := w.flags
-		delete(flags, canonicalFlag(imap.FlagDeleted))
-		msg := &message{
-			uid:      dst.uidNext,
-			loc:      locFile,
-			key:      w.id,
-			source:   w.source,
-			size:     w.size,
-			internal: w.internal,
-			flags:    flags,
+	err := b.e.mutateLocked(func() error {
+		if b.e.boxes[dst.name] != dst {
+			return errNo("no such mailbox")
 		}
-		dst.uidNext++
-		dst.msgs = append(dst.msgs, msg)
-		if msg.source != "" {
-			b.e.seen[msg.source] = struct{}{}
+		for _, w := range wrote {
+			flags := w.flags
+			delete(flags, canonicalFlag(imap.FlagDeleted))
+			msg := &message{
+				uid:      dst.uidNext,
+				loc:      locFile,
+				key:      w.id,
+				source:   w.source,
+				size:     w.size,
+				internal: w.internal,
+				flags:    flags,
+			}
+			dst.uidNext++
+			dst.msgs = append(dst.msgs, msg)
+			if msg.source != "" {
+				b.e.seen[msg.source] = struct{}{}
+			}
+			dstUIDs.AddNum(msg.uid)
 		}
-		dstUIDs.AddNum(msg.uid)
-	}
-	valid := dst.uidValid
-	dst.tracker.QueueNumMessages(uint32(len(dst.msgs)))
-	b.e.mu.Unlock()
-	if err := b.e.commit(ctx); err != nil {
+		b.e.queueCount(dst)
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	return &imap.CopyData{UIDValidity: valid, SourceUIDs: srcUIDs, DestUIDs: dstUIDs}, nil
+	committed = true
+	return &imap.CopyData{UIDValidity: dst.uidValid, SourceUIDs: srcUIDs, DestUIDs: dstUIDs}, nil
 }
 
 // Create adds a mailbox. The four standard names already exist.
@@ -1018,34 +1108,34 @@ func (e *Engine) Create(ctx context.Context, name string) error {
 		return errNo("invalid mailbox name")
 	}
 	e.mu.Lock()
-	if _, ok := e.resolveLocked(name); ok {
-		e.mu.Unlock()
-		return errNo("mailbox already exists")
-	}
-	e.boxes[name] = newBox(name, nil)
-	e.mu.Unlock()
-	return e.commit(ctx)
+	defer e.mu.Unlock()
+	return e.mutateLocked(func() error {
+		if _, ok := e.resolveLocked(name); ok {
+			return errNo("mailbox already exists")
+		}
+		e.boxes[name] = newBox(name, nil)
+		return nil
+	})
 }
 
 // Delete removes an empty mailbox that is not one of the four standard names.
 func (e *Engine) Delete(ctx context.Context, name string) error {
 	e.mu.Lock()
-	canon, ok := e.resolveLocked(name)
-	if !ok {
-		e.mu.Unlock()
-		return errNo("no such mailbox")
-	}
-	if _, special := CanonBox(canon); special {
-		e.mu.Unlock()
-		return errNo("mailbox is required")
-	}
-	if len(e.boxes[canon].msgs) != 0 {
-		e.mu.Unlock()
-		return errNo("mailbox is not empty")
-	}
-	delete(e.boxes, canon)
-	e.mu.Unlock()
-	return e.commit(ctx)
+	defer e.mu.Unlock()
+	return e.mutateLocked(func() error {
+		canon, ok := e.resolveLocked(name)
+		if !ok {
+			return errNo("no such mailbox")
+		}
+		if _, special := CanonBox(canon); special {
+			return errNo("mailbox is required")
+		}
+		if len(e.boxes[canon].msgs) != 0 {
+			return errNo("mailbox is not empty")
+		}
+		delete(e.boxes, canon)
+		return nil
+	})
 }
 
 // Rename renames a mailbox that is not one of the four standard names.
@@ -1055,24 +1145,23 @@ func (e *Engine) Rename(ctx context.Context, from, to string) error {
 		return errNo("invalid mailbox name")
 	}
 	e.mu.Lock()
-	canon, ok := e.resolveLocked(from)
-	if !ok {
-		e.mu.Unlock()
-		return errNo("no such mailbox")
-	}
-	if _, special := CanonBox(canon); special {
-		e.mu.Unlock()
-		return errNo("mailbox is required")
-	}
-	if _, exists := e.resolveLocked(to); exists {
-		e.mu.Unlock()
-		return errNo("mailbox already exists")
-	}
-	e.boxes[to] = e.boxes[canon]
-	e.boxes[to].name = to
-	delete(e.boxes, canon)
-	e.mu.Unlock()
-	return e.commit(ctx)
+	defer e.mu.Unlock()
+	return e.mutateLocked(func() error {
+		canon, ok := e.resolveLocked(from)
+		if !ok {
+			return errNo("no such mailbox")
+		}
+		if _, special := CanonBox(canon); special {
+			return errNo("mailbox is required")
+		}
+		if _, exists := e.resolveLocked(to); exists {
+			return errNo("mailbox already exists")
+		}
+		e.boxes[to] = e.boxes[canon]
+		e.boxes[to].name = to
+		delete(e.boxes, canon)
+		return nil
+	})
 }
 
 func validFolder(name string) bool {
@@ -1090,14 +1179,22 @@ func validFolder(name string) bool {
 }
 
 // Messages returns every message currently in the mailbox.
-func (b *Box) Messages() []Msg {
+func (b *Box) Messages(views ...*imapserver.SessionTracker) []Msg {
+	view := firstView(views)
 	b.e.mu.Lock()
 	defer b.e.mu.Unlock()
 	bx := b.box()
 	out := make([]Msg, 0, len(bx.msgs))
 	for i, m := range bx.msgs {
+		seq := uint32(i + 1)
+		if view != nil {
+			seq = view.EncodeSeqNum(seq)
+		}
+		if seq == 0 {
+			continue
+		}
 		out = append(out, Msg{
-			Seq:      uint32(i + 1),
+			Seq:      seq,
 			UID:      m.uid,
 			Loc:      m.loc,
 			Key:      m.key,
@@ -1112,9 +1209,15 @@ func (b *Box) Messages() []Msg {
 // SetSubscribed records an IMAP subscription.
 func (b *Box) SetSubscribed(ctx context.Context, on bool) error {
 	b.e.mu.Lock()
-	b.box().subscribed = on
-	b.e.mu.Unlock()
-	return b.e.commit(ctx)
+	defer b.e.mu.Unlock()
+	return b.e.mutateLocked(func() error {
+		bx := b.box()
+		if b.e.boxes[bx.name] != bx {
+			return errNo("no such mailbox")
+		}
+		bx.subscribed = on
+		return nil
+	})
 }
 
 func (b *Box) MatchNum(numSet imap.NumSet) []Msg {

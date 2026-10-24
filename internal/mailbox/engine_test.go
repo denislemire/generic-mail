@@ -3,6 +3,8 @@ package mailbox
 import (
 	"bytes"
 	"context"
+	"os"
+	"reflect"
 	"testing"
 	"time"
 
@@ -334,7 +336,10 @@ func TestSequenceSelectionWithPendingExpunge(t *testing.T) {
 	if len(got) != 1 || got[0] != 2 {
 		t.Fatalf("FETCH selected UIDs %v", got)
 	}
-	changed := b.Store(set, imap.StoreFlagsAdd, []imap.Flag{imap.FlagFlagged}, view)
+	changed, err := b.Store(set, imap.StoreFlagsAdd, []imap.Flag{imap.FlagFlagged}, view)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(changed) != 1 || changed[0].UID != 2 {
 		t.Fatalf("STORE selected %+v", changed)
 	}
@@ -347,4 +352,72 @@ func TestSequenceSelectionWithPendingExpunge(t *testing.T) {
 	}
 	// The deleted message's old sequence number must never select its successor.
 	b.ForEach(imap.SeqSetNum(1), func(msg Msg) { t.Fatalf("selected expunged sequence: %+v", msg) }, view)
+}
+
+func TestFailedMutationsAreInvisible(t *testing.T) {
+	operations := map[string]func(context.Context, *Engine, *Box) error{
+		"append": func(ctx context.Context, e *Engine, b *Box) error {
+			_, err := b.Append(ctx, bytes.NewBufferString("Subject: x\r\n\r\nbody"), nil)
+			return err
+		},
+		"copy": func(ctx context.Context, e *Engine, b *Box) error {
+			_, err := b.Copy(ctx, imap.UIDSetNum(1), "Archive")
+			return err
+		},
+		"store": func(ctx context.Context, e *Engine, b *Box) error {
+			_, err := b.Store(imap.UIDSetNum(1), imap.StoreFlagsAdd, []imap.Flag{imap.FlagSeen}, nil)
+			return err
+		},
+		"seen":      func(ctx context.Context, e *Engine, b *Box) error { return b.SetSeen([]imap.UID{1}) },
+		"expunge":   func(ctx context.Context, e *Engine, b *Box) error { return b.Expunge(ctx, nil) },
+		"create":    func(ctx context.Context, e *Engine, b *Box) error { return e.Create(ctx, "New") },
+		"rename":    func(ctx context.Context, e *Engine, b *Box) error { return e.Rename(ctx, "Archive", "New") },
+		"delete":    func(ctx context.Context, e *Engine, b *Box) error { return e.Delete(ctx, "Archive") },
+		"subscribe": func(ctx context.Context, e *Engine, b *Box) error { return b.SetSubscribed(ctx, false) },
+		"sync":      func(ctx context.Context, e *Engine, b *Box) error { return e.SyncInbound(ctx, "") },
+	}
+	for name, operation := range operations {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			store := blob.NewMem()
+			e, err := New(ctx, store, t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = e.Create(ctx, "Archive"); err != nil {
+				t.Fatal(err)
+			}
+			b, _ := e.Open("Drafts")
+			if _, err = b.Append(ctx, bytes.NewBufferString("Subject: x\r\n\r\nbody"), nil); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = b.Store(imap.UIDSetNum(1), imap.StoreFlagsAdd, []imap.Flag{imap.FlagDeleted}, nil); err != nil {
+				t.Fatal(err)
+			}
+			store.PutMeta("inbound/new", []byte("Subject: new\r\n\r\nbody"), time.Now())
+			before := e.snapshotLocked()
+			beforeFiles, _ := os.ReadDir(e.files)
+			if err = e.db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err = operation(ctx, e, b); err == nil {
+				t.Fatal("expected failure")
+			}
+			if !reflect.DeepEqual(before, e.snapshotLocked()) {
+				t.Fatal("failed mutation changed visible index")
+			}
+			if e.Ready() {
+				t.Fatal("failed sync changed readiness")
+			}
+			afterFiles, _ := os.ReadDir(e.files)
+			if len(afterFiles) != len(beforeFiles) {
+				t.Fatal("failed mutation leaked files")
+			}
+			tracker := b.Tracker().NewSession()
+			defer tracker.Close()
+			if tracker.EncodeSeqNum(1) != 1 || tracker.EncodeSeqNum(2) != 0 {
+				t.Fatal("failed mutation changed tracker count")
+			}
+		})
+	}
 }
