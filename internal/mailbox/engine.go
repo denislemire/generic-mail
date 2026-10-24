@@ -48,10 +48,12 @@ const (
 type Engine struct {
 	blobs blob.Store
 
+	deleteMu    sync.Mutex
 	mu          sync.Mutex
 	db          *state.DB
 	files       string
 	boxes       map[string]*box
+	deletes     map[string]struct{}
 	seen        map[string]struct{}
 	ready       bool
 	cache       map[string][]byte
@@ -123,6 +125,7 @@ func New(ctx context.Context, store blob.Store, dataDir string) (*Engine, error)
 		files:       filepath.Join(dataDir, "files"),
 		boxes:       map[string]*box{},
 		seen:        map[string]struct{}{},
+		deletes:     map[string]struct{}{},
 		cache:       map[string][]byte{},
 		cacheBudget: 64 << 20,
 	}
@@ -212,6 +215,7 @@ func CanonBox(name string) (string, bool) {
 
 // SyncInbound assigns UIDs to new objects under prefix (default inbound/).
 func (e *Engine) SyncInbound(ctx context.Context, prefix string) error {
+	e.retryDeletes(ctx)
 	if prefix == "" {
 		prefix = inboundPrefix
 	}
@@ -426,6 +430,9 @@ func (e *Engine) loadDB() error {
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	for _, key := range snap.Deletes {
+		e.deletes[key] = struct{}{}
+	}
 	for _, key := range snap.Seen {
 		e.seen[key] = struct{}{}
 	}
@@ -496,6 +503,10 @@ func (e *Engine) mutateLocked(change func() error) error {
 	for key := range e.seen {
 		seen[key] = struct{}{}
 	}
+	deletes := make(map[string]struct{}, len(e.deletes))
+	for key := range e.deletes {
+		deletes[key] = struct{}{}
+	}
 	ready := e.ready
 	e.pending = nil
 	err := change()
@@ -507,6 +518,7 @@ func (e *Engine) mutateLocked(change func() error) error {
 			*b = copyBox
 		}
 		e.boxes, e.seen, e.ready = original, seen, ready
+		e.deletes = deletes
 	} else {
 		for _, notify := range e.pending {
 			notify()
@@ -566,6 +578,10 @@ func (e *Engine) snapshotLocked() state.Snap {
 		snap.Seen = append(snap.Seen, key)
 	}
 	sort.Strings(snap.Seen)
+	for key := range e.deletes {
+		snap.Deletes = append(snap.Deletes, key)
+	}
+	sort.Strings(snap.Deletes)
 	return snap
 }
 
@@ -943,7 +959,8 @@ func (b *Box) Store(numSet imap.NumSet, op imap.StoreFlagsOp, flags []imap.Flag,
 }
 
 // Expunge removes \Deleted messages from this mailbox.
-// S3 objects are never deleted. A local file is removed when no row still points at it.
+// Trash queues source S3 deletion. Other mailboxes only remove their index rows.
+// A local file is removed when no row still points at it.
 func (b *Box) Expunge(ctx context.Context, uids *imap.UIDSet) error {
 	b.e.mu.Lock()
 	var files []string
@@ -977,6 +994,15 @@ func (b *Box) Expunge(ctx context.Context, uids *imap.UIDSet) error {
 		}
 		bx.msgs = keep
 		for _, m := range drop {
+			if bx.name == BoxTrash {
+				source := m.source
+				if source == "" && m.loc == locS3 {
+					source = m.key
+				}
+				if source != "" {
+					b.e.deletes[source] = struct{}{}
+				}
+			}
 			if m.loc == locS3 {
 				b.e.seen[m.key] = struct{}{}
 			}
@@ -1000,6 +1026,7 @@ func (b *Box) Expunge(ctx context.Context, uids *imap.UIDSet) error {
 			log.Printf("delete local %s: %v", id, err)
 		}
 	}
+	b.e.retryDeletes(ctx)
 	return nil
 }
 
@@ -1398,4 +1425,57 @@ func errNo(text string) error {
 		Text: text,
 	})
 	return &err
+}
+
+// retryDeletes drains the durable outbox. DeleteObject is idempotent, so a crash
+// between S3 deletion and SQLite acknowledgement is safe to retry.
+func (e *Engine) retryDeletes(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	e.deleteMu.Lock()
+	defer e.deleteMu.Unlock()
+	e.mu.Lock()
+	var keys []string
+	for key := range e.deletes {
+		used := false
+		for _, b := range e.boxes {
+			for _, m := range b.msgs {
+				if m.loc == locS3 && m.key == key {
+					used = true
+					break
+				}
+			}
+			if used {
+				break
+			}
+		}
+		if !used {
+			keys = append(keys, key)
+		}
+	}
+	e.mu.Unlock()
+	sort.Strings(keys)
+	if len(keys) > 64 {
+		keys = keys[:64]
+	}
+	for _, key := range keys {
+		if ctx.Err() != nil {
+			return
+		}
+		if err := e.blobs.Delete(ctx, key); err != nil && !errors.Is(err, blob.ErrNotFound) {
+			log.Printf("S3 delete pending for %q: %v", key, err)
+			continue
+		}
+		e.mu.Lock()
+		err := e.mutateLocked(func() error { delete(e.deletes, key); return nil })
+		if err == nil {
+			ck := locS3 + "\n" + key
+			e.cacheN -= len(e.cache[ck])
+			delete(e.cache, ck)
+		}
+		e.mu.Unlock()
+		if err != nil {
+			log.Printf("S3 delete acknowledgement pending for %q: %v", key, err)
+		}
+	}
 }
