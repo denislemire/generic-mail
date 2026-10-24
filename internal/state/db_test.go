@@ -75,3 +75,49 @@ func TestFailedSaveCanBeRetried(t *testing.T) {
 		t.Fatalf("retry lost: %+v %v", loaded, err)
 	}
 }
+
+func TestSyncHistoryRebasesAfterLegacyWrites(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	when := time.Now().UTC()
+	snap := Snap{Boxes: []Box{{Name: "Drafts", UIDValidity: 42, UIDNext: 3, HighestModSeq: 10, Messages: []Msg{{UID: 1, ModSeq: 9, Loc: "file", Ref: "one", Internal: when}, {UID: 2, ModSeq: 10, Loc: "file", Ref: "two", Internal: when}}}}}
+	if err = db.Save(snap); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate the old application: changes the base rows, leaves sync metadata.
+	if _, err = db.sql.Exec(`UPDATE message SET flags='["finance"]' WHERE uid=1;DELETE FROM message WHERE uid=2;`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	db, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := db.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := loaded.Boxes[0]
+	if b.HighestModSeq != 11 || b.Messages[0].ModSeq != 11 || len(b.Expunged) != 1 || b.Expunged[0].UID != 2 {
+		t.Fatalf("bad rebase: %+v", b)
+	}
+	if err = db.Save(loaded); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	db, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	again, err := db.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Boxes[0].HighestModSeq != 11 || len(again.Boxes[0].Expunged) != 1 {
+		t.Fatal("rebase was not persisted", again)
+	}
+}

@@ -2,10 +2,12 @@
 package state
 
 import (
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"sort"
 	"sync"
 	"time"
 
@@ -14,15 +16,18 @@ import (
 
 // Box is one mailbox in the index.
 type Box struct {
-	Name        string
-	UIDValidity uint32
-	UIDNext     uint32
-	Subscribed  bool
-	Messages    []Msg
+	Name          string
+	UIDValidity   uint32
+	UIDNext       uint32
+	Subscribed    bool
+	HighestModSeq uint64
+	Expunged      []Expunged
+	Messages      []Msg
 }
 
 // Msg is one index row. Loc is "s3" or "file".
 type Msg struct {
+	ModSeq   uint64
 	UID      uint32
 	Loc      string
 	Ref      string
@@ -30,6 +35,17 @@ type Msg struct {
 	Size     int64
 	Internal time.Time
 	Flags    []string
+}
+
+type Expunged struct {
+	UID    uint32
+	ModSeq uint64
+}
+type syncState struct {
+	Fingerprint string
+	Highest     uint64
+	Expunged    []Expunged
+	Messages    map[uint32]uint64
 }
 
 // Snap is a full index.
@@ -41,10 +57,11 @@ type Snap struct {
 
 // DB is the SQLite index.
 type DB struct {
-	sql    *sql.DB
-	mu     sync.Mutex
-	last   Snap
-	loaded bool
+	sql       *sql.DB
+	mu        sync.Mutex
+	last      Snap
+	loaded    bool
+	syncDirty map[string]bool
 }
 
 // Open creates the schema if needed.
@@ -87,6 +104,7 @@ func (d *DB) Load() (Snap, error) {
 }
 
 func (d *DB) load() (Snap, error) {
+	d.syncDirty = map[string]bool{}
 	var snap Snap
 	rows, err := d.sql.Query(`SELECT name, uid_validity, uid_next, subscribed FROM mailbox`)
 	if err != nil {
@@ -142,6 +160,60 @@ func (d *DB) load() (Snap, error) {
 	if err := mrows.Err(); err != nil {
 		return snap, err
 	}
+
+	syncRows, err := d.sql.Query(`SELECT mailbox,data FROM mailbox_sync`)
+	if err != nil {
+		return snap, err
+	}
+	for syncRows.Next() {
+		var name, raw string
+		if err := syncRows.Scan(&name, &raw); err != nil {
+			syncRows.Close()
+			return snap, err
+		}
+		var data syncState
+		if err := json.Unmarshal([]byte(raw), &data); err != nil {
+			syncRows.Close()
+			return snap, err
+		}
+		if b := byName[name]; b != nil {
+			b.HighestModSeq = data.Highest
+			b.Expunged = data.Expunged
+
+			if data.Fingerprint != "" && data.Fingerprint != syncFingerprint(*b) {
+				// An older binary or external tool changed mailbox rows while the
+				// extension was unavailable. Rebase all current flags and record losses
+				// above the durable clock, rather than silently reusing stale MODSEQs.
+				if data.Highest >= uint64(1<<63-1) {
+					syncRows.Close()
+					return snap, fmt.Errorf("mailbox change number exhausted")
+				}
+				b.HighestModSeq = data.Highest + 1
+				current := map[uint32]bool{}
+				for i := range b.Messages {
+					b.Messages[i].ModSeq = b.HighestModSeq
+					current[b.Messages[i].UID] = true
+				}
+				for uid := range data.Messages {
+					if !current[uid] {
+						b.Expunged = append(b.Expunged, Expunged{UID: uid, ModSeq: b.HighestModSeq})
+					}
+				}
+				sort.Slice(b.Expunged, func(i, j int) bool { return b.Expunged[i].UID < b.Expunged[j].UID })
+				d.syncDirty[name] = true
+			} else {
+				for i := range b.Messages {
+					b.Messages[i].ModSeq = data.Messages[b.Messages[i].UID]
+				}
+			}
+
+		}
+	}
+	if err := syncRows.Err(); err != nil {
+		syncRows.Close()
+		return snap, err
+	}
+	syncRows.Close()
 	srows, err := d.sql.Query(`SELECT key FROM seen`)
 	if err != nil {
 		return snap, err
@@ -207,6 +279,20 @@ func (d *DB) Save(snap Snap) error {
 				return err
 			}
 		}
+
+		if d.syncDirty[b.Name] || !exists || old.HighestModSeq != b.HighestModSeq || !reflect.DeepEqual(old.Expunged, b.Expunged) || !reflect.DeepEqual(old.Messages, b.Messages) {
+			data := syncState{Fingerprint: syncFingerprint(b), Highest: b.HighestModSeq, Expunged: b.Expunged, Messages: map[uint32]uint64{}}
+			for _, m := range b.Messages {
+				data.Messages[m.UID] = m.ModSeq
+			}
+			raw, err := json.Marshal(data)
+			if err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`INSERT INTO mailbox_sync(mailbox,data) VALUES(?,?) ON CONFLICT(mailbox) DO UPDATE SET data=excluded.data`, b.Name, string(raw)); err != nil {
+				return err
+			}
+		}
 		oldMessages := map[uint32]Msg{}
 		for _, m := range old.Messages {
 			oldMessages[m.UID] = m
@@ -234,6 +320,9 @@ func (d *DB) Save(snap Snap) error {
 		delete(oldBoxes, b.Name)
 	}
 	for name := range oldBoxes {
+		if _, err = tx.Exec(`DELETE FROM mailbox_sync WHERE mailbox=?`, name); err != nil {
+			return err
+		}
 		if err = enqueuePush(tx, name); err != nil {
 			return err
 		}
@@ -286,12 +375,14 @@ func (d *DB) Save(snap Snap) error {
 		return err
 	}
 	d.last = cloneSnap(snap)
+	d.syncDirty = nil
 	return nil
 }
 
 func cloneSnap(s Snap) Snap {
 	out := Snap{Boxes: append([]Box(nil), s.Boxes...), Seen: append([]string(nil), s.Seen...), Deletes: append([]string(nil), s.Deletes...)}
 	for i := range out.Boxes {
+		out.Boxes[i].Expunged = append([]Expunged(nil), s.Boxes[i].Expunged...)
 		out.Boxes[i].Messages = append([]Msg(nil), s.Boxes[i].Messages...)
 		for j := range out.Boxes[i].Messages {
 			out.Boxes[i].Messages[j].Flags = append([]string(nil), s.Boxes[i].Messages[j].Flags...)
@@ -301,6 +392,7 @@ func cloneSnap(s Snap) Snap {
 }
 
 const schema = `
+CREATE TABLE IF NOT EXISTS mailbox_sync (mailbox TEXT PRIMARY KEY, data TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS mailbox (
   name TEXT PRIMARY KEY,
   uid_validity INTEGER NOT NULL,
@@ -325,3 +417,19 @@ CREATE TABLE IF NOT EXISTS seen (
   key TEXT PRIMARY KEY
 );
 `
+
+// syncFingerprint detects writes made by a binary that predates MODSEQ support.
+func syncFingerprint(b Box) string {
+	messages := append([]Msg(nil), b.Messages...)
+	for i := range messages {
+		messages[i].ModSeq = 0
+		messages[i].Internal = messages[i].Internal.UTC()
+		messages[i].Flags = append([]string(nil), messages[i].Flags...)
+		sort.Strings(messages[i].Flags)
+	}
+	raw, _ := json.Marshal(struct {
+		Validity, Next uint32
+		Messages       []Msg
+	}{b.UIDValidity, b.UIDNext, messages})
+	return fmt.Sprintf("%x", sha256.Sum256(raw))
+}

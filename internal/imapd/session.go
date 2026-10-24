@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/subtle"
+	"errors"
 	"strings"
 	"time"
 
@@ -33,11 +34,12 @@ func (s *Server) NewSession() imapserver.Session {
 }
 
 type session struct {
-	srv      *Server
-	authed   bool
-	box      *mailbox.Box
-	view     *imapserver.SessionTracker
-	readOnly bool
+	srv           *Server
+	authed        bool
+	box           *mailbox.Box
+	view          *imapserver.SessionTracker
+	readOnly      bool
+	expungeModSeq uint64
 }
 
 func (s *session) Close() error {
@@ -113,9 +115,10 @@ func (s *session) Select(name string, options *imap.SelectOptions) (*imap.Select
 	}
 	s.dropView()
 	s.box = box
-	s.view = box.Tracker().NewSession()
+	data, view := box.SelectSync(options)
+	s.view = view
 	s.readOnly = options != nil && options.ReadOnly
-	return box.SelectData(), nil
+	return data, nil
 }
 
 func (s *session) Unselect() error {
@@ -222,14 +225,16 @@ func (s *session) Expunge(w *imapserver.ExpungeWriter, uids *imap.UIDSet) error 
 		return no("mailbox is read-only")
 	}
 	_ = w
-	return s.box.Expunge(context.Background(), uids)
+	return s.box.Expunge(context.Background(), uids, func(n uint64) { s.expungeModSeq = n })
 }
 
 func (s *session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria, options *imap.SearchOptions) (*imap.SearchData, error) {
 	if err := s.selected(); err != nil {
 		return nil, err
 	}
-	_ = options
+	if options == nil {
+		options = &imap.SearchOptions{ReturnAll: true}
+	}
 	messages := s.box.Messages(s.view)
 	var candidates map[state.ContentKey]bool
 	if query := mailbox.SearchIndexQuery(criteria); query != "" {
@@ -239,6 +244,7 @@ func (s *session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria,
 		}
 	}
 	var data imap.SearchData
+	var minMod, maxMod uint64
 	var seqSet imap.SeqSet
 	var uidSet imap.UIDSet
 	for _, msg := range messages {
@@ -272,11 +278,25 @@ func (s *session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria,
 		}
 		if data.Min == 0 || num < data.Min {
 			data.Min = num
+			minMod = msg.ModSeq
 		}
 		if data.Max == 0 || num > data.Max {
 			data.Max = num
+			maxMod = msg.ModSeq
 		}
 		data.Count++
+		if hasModSeq(criteria) && msg.ModSeq > data.ModSeq {
+			data.ModSeq = msg.ModSeq
+		}
+	}
+	if hasModSeq(criteria) && !options.ReturnAll && !options.ReturnCount {
+		data.ModSeq = 0
+		if options.ReturnMin {
+			data.ModSeq = minMod
+		}
+		if options.ReturnMax && maxMod > data.ModSeq {
+			data.ModSeq = maxMod
+		}
 	}
 	switch kind {
 	case imapserver.NumKindSeq:
@@ -301,9 +321,23 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 			break
 		}
 	}
+
+	if options.Vanished {
+		if uids, ok := numSet.(imap.UIDSet); ok {
+			gone := s.box.Vanished(options.ChangedSince, uids)
+			if len(gone) > 0 {
+				if err := w.WriteVanished(gone); err != nil {
+					return err
+				}
+			}
+		}
+	}
 	var fetchErr error
 	s.box.ForEach(numSet, func(msg mailbox.Msg) {
 		if fetchErr != nil {
+			return
+		}
+		if (options.ChangedSinceSet || options.ChangedSince > 0) && msg.ModSeq <= options.ChangedSince {
 			return
 		}
 		seq := msg.Seq
@@ -324,6 +358,12 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 				fetchErr = err
 				return
 			}
+			for _, updated := range s.box.Messages(s.view) {
+				if updated.UID == msg.UID {
+					msg = updated
+					break
+				}
+			}
 			found := false
 			for _, flag := range msg.Flags {
 				found = found || strings.EqualFold(string(flag), string(imap.FlagSeen))
@@ -335,6 +375,7 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 		mw := w.CreateMessage(seq)
 		responseOptions := *options
 		responseOptions.Flags = options.Flags || (markSeen && !s.readOnly)
+		responseOptions.ModSeq = options.ModSeq || (w.CondStore() && responseOptions.Flags)
 		fetchErr = writeFetch(mw, msg, raw, &responseOptions)
 	}, s.view)
 	return fetchErr
@@ -347,23 +388,28 @@ func (s *session) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *im
 	if s.readOnly {
 		return no("mailbox is read-only")
 	}
-	_ = options
-	changed, err := s.box.Store(numSet, flags.Op, flags.Flags, s.view)
-	if err != nil {
+
+	changed, err := s.box.Store(numSet, flags.Op, flags.Flags, s.view, options)
+	var modified *mailbox.StoreModified
+	if err != nil && !errors.As(err, &modified) {
 		return err
 	}
-	if flags.Silent {
-		return nil
+	if flags.Silent && !w.CondStore() {
+		return err
 	}
+
 	for _, msg := range changed {
 		seq := msg.Seq
 		if seq == 0 {
 			continue
 		}
 		mw := w.CreateMessage(seq)
-		if err := writeFetch(mw, msg, nil, &imap.FetchOptions{Flags: true}); err != nil {
+		if err := writeFetch(mw, msg, nil, &imap.FetchOptions{Flags: !flags.Silent, ModSeq: w.CondStore()}); err != nil {
 			return err
 		}
+	}
+	if modified != nil {
+		return &imap.Error{Type: imap.StatusResponseTypeOK, Code: imap.ResponseCode("MODIFIED " + modified.Set.String()), Text: "Conditional STORE completed"}
 	}
 	return nil
 }
@@ -411,6 +457,9 @@ func no(text string) error {
 
 func writeFetch(w *imapserver.FetchResponseWriter, msg mailbox.Msg, raw []byte, options *imap.FetchOptions) error {
 	w.WriteUID(msg.UID)
+	if options.ModSeq {
+		w.WriteModSeq(msg.ModSeq)
+	}
 	if options.Flags {
 		w.WriteFlags(msg.Flags)
 	}
@@ -477,3 +526,39 @@ func (s *session) RegisterApplePush(registration *imapserver.ApplePushRegistrati
 	defer cancel()
 	return s.srv.Engine.RegisterPush(ctx, registration.AccountID, token, names)
 }
+
+func hasModSeq(c *imap.SearchCriteria) bool {
+	if c.ModSeq != nil {
+		return true
+	}
+	for i := range c.Not {
+		if hasModSeq(&c.Not[i]) {
+			return true
+		}
+	}
+	for i := range c.Or {
+		if hasModSeq(&c.Or[i][0]) || hasModSeq(&c.Or[i][1]) {
+			return true
+		}
+	}
+	return false
+}
+func (s *session) HighestModSeq() uint64 {
+	if s.box == nil {
+		return 0
+	}
+	n := s.box.SelectData().HighestModSeq
+	if limit := s.PendingExpungeLimit(); limit != 0 && limit < n {
+		return limit
+	}
+	return n
+}
+
+func (s *session) PendingExpungeLimit() uint64 {
+	if s.view == nil {
+		return 0
+	}
+	return s.view.PendingExpungeLimit()
+}
+
+func (s *session) ExpungeModSeq() uint64 { return s.expungeModSeq }

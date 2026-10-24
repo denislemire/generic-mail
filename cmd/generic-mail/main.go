@@ -22,6 +22,7 @@ import (
 	"github.com/denislemire/generic-mail/internal/sesmail"
 	"github.com/denislemire/generic-mail/internal/smtpd"
 
+	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
 )
 
@@ -91,6 +92,7 @@ func main() {
 	tlsConfig := &tls.Config{GetCertificate: certificates.getCertificate, MinVersion: tls.VersionTLS12}
 
 	imapSrv := imapserver.New(&imapserver.Options{
+		Caps: imap.CapSet{imap.CapIMAP4rev1: {}, imap.CapUIDPlus: {}, imap.CapCondStore: {}, imap.CapQResync: {}},
 		NewSession: func(*imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
 			return (&imapd.Server{Engine: engine, Username: username, Password: password, OAuth: checker, PushTopic: pushClient.Topic()}).NewSession(), &imapserver.GreetingData{}, nil
 		},

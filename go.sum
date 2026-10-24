@@ -38,8 +38,8 @@ github.com/aws/aws-sdk-go-v2/service/sts v1.38.6 h1:p3jIvqYwUZgu/XYeI48bJxOhvm47
 github.com/aws/aws-sdk-go-v2/service/sts v1.38.6/go.mod h1:WtKK+ppze5yKPkZ0XwqIVWD4beCwv056ZbPQNoeHqM8=
 github.com/aws/smithy-go v1.23.0 h1:8n6I3gXzWJB2DxBDnfxgBaSX6oe0d/t10qGz7OKqMCE=
 github.com/aws/smithy-go v1.23.0/go.mod h1:t1ufH5HMublsJYulve2RKmHDC15xu1f26kHCp/HgceI=
-github.com/denislemire/go-imap/v2 v2.0.0-beta.8.0.20261024012418-6f41b4aefe26 h1:utHHje7MEihuInNIgUrA5BDUwLgrtdXPOc+iRAP4YPk=
-github.com/denislemire/go-imap/v2 v2.0.0-beta.8.0.20261024012418-6f41b4aefe26/go.mod h1:dhoFe2Q0PwLrMD7oZw8ODuaD0vLYPe5uj2wcOMnvh48=
+github.com/denislemire/go-imap/v2 v2.0.0-beta.8.0.20261024202336-94cef02b82c2 h1:/xJgIQ3xYYvDJdMHp6Ollh2O+j/7OsYcMACWINgwQBg=
+github.com/denislemire/go-imap/v2 v2.0.0-beta.8.0.20261024202336-94cef02b82c2/go.mod h1:dhoFe2Q0PwLrMD7oZw8ODuaD0vLYPe5uj2wcOMnvh48=
 github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=
 github.com/dustin/go-humanize v1.0.1/go.mod h1:Mu1zIs6XwVuF/gI1OepvI0qD18qycQx+mFykh5fBlto=
 github.com/emersion/go-message v0.18.2 h1:rl55SQdjd9oJcIoQNhubD2Acs1E6IzlZISRTK7x/Lpg=
