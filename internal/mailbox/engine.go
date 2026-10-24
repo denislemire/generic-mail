@@ -77,6 +77,8 @@ const (
 type box struct {
 	name       string
 	special    []imap.MailboxAttr
+	highest    uint64
+	expunged   []state.Expunged
 	uidValid   uint32
 	uidNext    imap.UID
 	subscribed bool
@@ -85,6 +87,7 @@ type box struct {
 }
 
 type message struct {
+	modSeq   uint64
 	uid      imap.UID
 	loc      string
 	key      string
@@ -162,6 +165,9 @@ func New(ctx context.Context, store blob.Store, dataDir string, options ...Optio
 		return e, nil
 	}
 	if err := e.loadDB(); err != nil {
+		return nil, err
+	}
+	if err := e.commit(ctx); err != nil {
 		return nil, err
 	}
 	return e, nil
@@ -463,6 +469,8 @@ func (e *Engine) loadDB() error {
 			e.boxes[fb.Name] = b
 		}
 		b.uidValid = fb.UIDValidity
+		b.highest = fb.HighestModSeq
+		b.expunged = append([]state.Expunged(nil), fb.Expunged...)
 		if fb.UIDNext == 0 {
 			b.uidNext = 1
 		} else {
@@ -483,6 +491,7 @@ func (e *Engine) loadDB() error {
 			}
 			b.msgs = append(b.msgs, &message{
 				uid:      imap.UID(fm.UID),
+				modSeq:   fm.ModSeq,
 				loc:      fm.Loc,
 				key:      fm.Ref,
 				source:   fm.Source,
@@ -500,6 +509,16 @@ func (e *Engine) loadDB() error {
 func (e *Engine) commit(_ context.Context) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	for _, b := range e.boxes {
+		if b.highest == 0 {
+			b.highest = 1
+		}
+		for _, m := range b.msgs {
+			if m.modSeq == 0 {
+				m.modSeq = b.highest
+			}
+		}
+	}
 	return e.db.Save(e.snapshotLocked())
 }
 
@@ -511,6 +530,7 @@ func (e *Engine) mutateLocked(change func() error) error {
 	for name, b := range e.boxes {
 		original[name] = b
 		copyBox := *b
+		copyBox.expunged = append([]state.Expunged(nil), b.expunged...)
 		copyBox.msgs = make([]*message, len(b.msgs))
 		for i, m := range b.msgs {
 			copyMsg := *m
@@ -530,6 +550,9 @@ func (e *Engine) mutateLocked(change func() error) error {
 	ready := e.ready
 	e.pending = nil
 	err := change()
+	if err == nil {
+		err = e.assignChangesLocked(saved)
+	}
 	if err == nil {
 		err = e.db.Save(e.snapshotLocked())
 	}
@@ -555,11 +578,21 @@ func (e *Engine) queueCount(b *box) {
 
 func (e *Engine) queueFlags(b *box, seq uint32, m *message, source *imapserver.SessionTracker) {
 	uid, flags := m.uid, flagList(m.flags)
-	e.pending = append(e.pending, func() { b.tracker.QueueMessageFlags(seq, uid, flags, source) })
+	e.pending = append(e.pending, func() { b.tracker.QueueMessageFlagsModSeq(seq, uid, flags, m.modSeq, source) })
 }
 
 func (e *Engine) queueExpunge(b *box, seq uint32) {
-	e.pending = append(e.pending, func() { b.tracker.QueueExpunge(seq) })
+	uid := b.msgs[seq-1].uid
+	e.pending = append(e.pending, func() {
+		modSeq := uint64(0)
+		for _, x := range b.expunged {
+			if x.UID == uint32(uid) {
+				modSeq = x.ModSeq
+				break
+			}
+		}
+		b.tracker.QueueExpungeUIDModSeq(seq, uid, modSeq)
+	})
 }
 
 func (e *Engine) snapshotLocked() state.Snap {
@@ -572,7 +605,8 @@ func (e *Engine) snapshotLocked() state.Snap {
 	for _, name := range names {
 		b := e.boxes[name]
 		box := state.Box{
-			Name:        name,
+			Name:          name,
+			HighestModSeq: b.highest, Expunged: append([]state.Expunged(nil), b.expunged...),
 			UIDValidity: b.uidValid,
 			UIDNext:     uint32(b.uidNext),
 			Subscribed:  b.subscribed,
@@ -580,6 +614,7 @@ func (e *Engine) snapshotLocked() state.Snap {
 		for _, m := range b.msgs {
 			fm := state.Msg{
 				UID:      uint32(m.uid),
+				ModSeq:   m.modSeq,
 				Loc:      m.loc,
 				Ref:      m.key,
 				Source:   m.source,
@@ -718,8 +753,21 @@ func (b *Box) SelectData() *imap.SelectData {
 	b.e.mu.Lock()
 	defer b.e.mu.Unlock()
 	bx := b.box()
+	return selectDataLocked(bx)
+}
+func selectDataLocked(bx *box) *imap.SelectData {
+	flags := map[imap.Flag]struct{}{}
+	for _, m := range bx.msgs {
+		for f := range m.flags {
+			flags[f] = struct{}{}
+		}
+	}
+	for _, f := range []imap.Flag{imap.FlagSeen, imap.FlagAnswered, imap.FlagFlagged, imap.FlagDeleted, imap.FlagDraft} {
+		flags[canonicalFlag(f)] = struct{}{}
+	}
 	return &imap.SelectData{
-		Flags:          []imap.Flag{imap.FlagSeen, imap.FlagAnswered, imap.FlagFlagged, imap.FlagDeleted, imap.FlagDraft},
+		HighestModSeq:  bx.highest,
+		Flags:          flagList(flags),
 		PermanentFlags: []imap.Flag{imap.FlagSeen, imap.FlagAnswered, imap.FlagFlagged, imap.FlagDeleted, imap.FlagDraft, imap.FlagWildcard},
 		NumMessages:    uint32(len(bx.msgs)),
 		UIDNext:        bx.uidNext,
@@ -739,7 +787,7 @@ func (b *Box) StatusData(opts *imap.StatusOptions) *imap.StatusData {
 	b.e.mu.Lock()
 	defer b.e.mu.Unlock()
 	bx := b.box()
-	data := &imap.StatusData{Mailbox: bx.name}
+	data := &imap.StatusData{Mailbox: bx.name, HighestModSeq: bx.highest}
 	if opts != nil && opts.NumMessages {
 		n := uint32(len(bx.msgs))
 		data.NumMessages = &n
@@ -785,6 +833,11 @@ func (b *Box) StatusData(opts *imap.StatusOptions) *imap.StatusData {
 
 // Append stores a message as a local file. INBOX is the SES receipt set.
 func (b *Box) Append(ctx context.Context, r io.Reader, opts *imap.AppendOptions) (*imap.AppendData, error) {
+	if opts != nil {
+		if err := validateFlags(opts.Flags); err != nil {
+			return nil, err
+		}
+	}
 	if b.Name() == BoxINBOX {
 		return nil, errNo("INBOX only accepts mail delivered by SES")
 	}
@@ -817,6 +870,9 @@ func (b *Box) Append(ctx context.Context, r io.Reader, opts *imap.AppendOptions)
 		}
 		msg := &message{uid: bx.uidNext, loc: locFile, key: id, size: int64(len(raw)), internal: when, flags: map[imap.Flag]struct{}{}}
 		for _, f := range flags {
+			if strings.EqualFold(string(f), `\Recent`) {
+				continue
+			}
 			msg.flags[canonicalFlag(f)] = struct{}{}
 		}
 		bx.uidNext++
@@ -854,6 +910,7 @@ type Msg struct {
 	Size     int64
 	Internal time.Time
 	Flags    []imap.Flag
+	ModSeq   uint64
 }
 
 // ForEach calls fn for each selected message. The mailbox lock is released
@@ -883,6 +940,7 @@ func (b *Box) ForEach(numSet imap.NumSet, fn func(Msg), views ...*imapserver.Ses
 			Size:     m.size,
 			Internal: m.internal,
 			Flags:    flagList(m.flags),
+			ModSeq:   m.modSeq,
 		})
 	}
 	b.e.mu.Unlock()
@@ -923,10 +981,17 @@ func (b *Box) SetSeen(uids []imap.UID) error {
 }
 
 // Store commits flags before returning them or notifying other sessions.
-func (b *Box) Store(numSet imap.NumSet, op imap.StoreFlagsOp, flags []imap.Flag, session *imapserver.SessionTracker) ([]Msg, error) {
+func (b *Box) Store(numSet imap.NumSet, op imap.StoreFlagsOp, flags []imap.Flag, session *imapserver.SessionTracker, options ...*imap.StoreOptions) ([]Msg, error) {
+	if err := validateFlags(flags); err != nil {
+		return nil, err
+	}
 	b.e.mu.Lock()
 	defer b.e.mu.Unlock()
 	var changed []Msg
+	var failed imap.NumSet = imap.UIDSet{}
+	if _, ok := numSet.(imap.SeqSet); ok {
+		failed = imap.SeqSet{}
+	}
 	err := b.e.mutateLocked(func() error {
 		bx := b.box()
 		if b.e.boxes[bx.name] != bx {
@@ -936,6 +1001,22 @@ func (b *Box) Store(numSet imap.NumSet, op imap.StoreFlagsOp, flags []imap.Flag,
 		for i, m := range bx.msgs {
 			seq := uint32(i + 1)
 			if !containsView(numSet, seq, m.uid, session) {
+				continue
+			}
+
+			if len(options) > 0 && options[0] != nil && (options[0].UnchangedSinceSet || options[0].UnchangedSince > 0) && m.modSeq > options[0].UnchangedSince {
+				switch f := failed.(type) {
+				case imap.UIDSet:
+					f.AddNum(m.uid)
+					failed = f
+				case imap.SeqSet:
+					n := seq
+					if session != nil {
+						n = session.EncodeSeqNum(n)
+					}
+					f.AddNum(n)
+					failed = f
+				}
 				continue
 			}
 			applyFlags(m.flags, op, flags)
@@ -950,13 +1031,25 @@ func (b *Box) Store(numSet imap.NumSet, op imap.StoreFlagsOp, flags []imap.Flag,
 	if err != nil {
 		return nil, err
 	}
+
+	for i := range changed {
+		for _, m := range b.box().msgs {
+			if m.uid == changed[i].UID {
+				changed[i].ModSeq = m.modSeq
+				break
+			}
+		}
+	}
+	if failed.String() != "" {
+		return changed, &StoreModified{Set: failed}
+	}
 	return changed, nil
 }
 
 // Expunge removes \Deleted messages from this mailbox.
 // Trash queues source S3 deletion. Other mailboxes only remove their index rows.
 // A local file is removed when no row still points at it.
-func (b *Box) Expunge(ctx context.Context, uids *imap.UIDSet) error {
+func (b *Box) Expunge(ctx context.Context, uids *imap.UIDSet, completed ...func(uint64)) error {
 	b.e.mu.Lock()
 	var files []string
 	err := b.e.mutateLocked(func() error {
@@ -1012,6 +1105,11 @@ func (b *Box) Expunge(ctx context.Context, uids *imap.UIDSet) error {
 		}
 		return nil
 	})
+	if err == nil {
+		for _, done := range completed {
+			done(b.box().highest)
+		}
+	}
 	b.e.mu.Unlock()
 	if err != nil {
 		return err
@@ -1249,6 +1347,7 @@ func (b *Box) Messages(views ...*imapserver.SessionTracker) []Msg {
 			Size:     m.size,
 			Internal: m.internal,
 			Flags:    flagList(m.flags),
+			ModSeq:   m.modSeq,
 		})
 	}
 	return out
@@ -1283,6 +1382,9 @@ func applyFlags(dst map[imap.Flag]struct{}, op imap.StoreFlagsOp, flags []imap.F
 		fallthrough
 	case imap.StoreFlagsAdd:
 		for _, f := range flags {
+			if strings.EqualFold(string(f), `\Recent`) {
+				continue
+			}
 			dst[canonicalFlag(f)] = struct{}{}
 		}
 	case imap.StoreFlagsDel:

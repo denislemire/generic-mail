@@ -83,6 +83,6 @@ go test ./internal/mailbox -run '^$' -bench BenchmarkSearchIndex -benchtime=250m
 ```
 
 Roundcube can additionally use its SQL-backed `imap_cache` for indexes. Its
-`messages_cache` option requires QRESYNC/CONDSTORE; keep that disabled while the
-gateway does not implement those extensions. No capability should be advertised
-just to enable a client cache.
+`messages_cache` option requires QRESYNC/CONDSTORE, implemented in release 0.7.
+It can be enabled after verifying the gateway capabilities. See
+[IMAP synchronization](imap-sync.md) for persistence and client behavior.

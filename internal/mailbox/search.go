@@ -16,6 +16,9 @@ func matchCriteria(msg Msg, raw []byte, seq uint32, criteria *imap.SearchCriteri
 	if criteria == nil {
 		return true
 	}
+	if criteria.ModSeq != nil && msg.ModSeq < criteria.ModSeq.ModSeq {
+		return false
+	}
 	for _, seqSet := range criteria.SeqNum {
 		if seq == 0 || !seqSet.Contains(seq) {
 			return false
@@ -139,6 +142,9 @@ func bodyOnly(raw []byte) []byte {
 // unknown result means exact matching needs MIME bytes. In particular OR with
 // an already true metadata arm and NOT of a known arm remain I/O-free.
 func MatchMetadata(msg Msg, seq uint32, c *imap.SearchCriteria) (matched, known bool) {
+	if c != nil && c.ModSeq != nil && msg.ModSeq < c.ModSeq.ModSeq {
+		return false, true
+	}
 	if c == nil {
 		return true, true
 	}
