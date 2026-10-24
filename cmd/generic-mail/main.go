@@ -63,11 +63,12 @@ func main() {
 		log.Fatalf("oauth: %v", err)
 	}
 
-	cert, err := tls.LoadX509KeyPair(env("TLS_CERT", "/tls/tls.crt"), env("TLS_KEY", "/tls/tls.key"))
+	certificates, err := newCertificateReloader(env("TLS_CERT", "/tls/tls.crt"), env("TLS_KEY", "/tls/tls.key"))
 	if err != nil {
 		log.Fatalf("tls: %v", err)
 	}
-	tlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+	go certificates.watch(ctx)
+	tlsConfig := &tls.Config{GetCertificate: certificates.getCertificate, MinVersion: tls.VersionTLS12}
 
 	imapSrv := imapserver.New(&imapserver.Options{
 		NewSession: func(*imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
