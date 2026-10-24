@@ -1137,8 +1137,21 @@ func copyFlags(in map[imap.Flag]struct{}) map[imap.Flag]struct{} {
 func flagList(flags map[imap.Flag]struct{}) []imap.Flag {
 	out := make([]imap.Flag, 0, len(flags))
 	for f := range flags {
+		switch canonicalFlag(f) {
+		case canonicalFlag(imap.FlagSeen):
+			f = imap.FlagSeen
+		case canonicalFlag(imap.FlagAnswered):
+			f = imap.FlagAnswered
+		case canonicalFlag(imap.FlagFlagged):
+			f = imap.FlagFlagged
+		case canonicalFlag(imap.FlagDeleted):
+			f = imap.FlagDeleted
+		case canonicalFlag(imap.FlagDraft):
+			f = imap.FlagDraft
+		}
 		out = append(out, f)
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out
 }
 
