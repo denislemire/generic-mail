@@ -76,11 +76,11 @@ securityContext:
 
 resources:
   requests:
-    cpu: 50m
-    memory: 64Mi
+    cpu: 100m
+    memory: 128Mi
   limits:
     cpu: "1"
-    memory: 256Mi
+    memory: 512Mi
 
 # Native iPhone Mail push requires an Apple-approved Mail APNs topic.
 # Disabled until the topic and .p8 credentials have been provisioned.
@@ -95,3 +95,7 @@ applePush:
 inboundEvents:
   queueURL: ""
   region: "" # Defaults to mailbox.s3Region.
+
+# Disposable S3 body cache on the persistent volume, separate from owned mail.
+cache:
+  diskBytes: 536870912 # 512 MiB; 0 disables the disk body cache.

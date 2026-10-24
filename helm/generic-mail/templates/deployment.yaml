@@ -96,6 +96,8 @@ spec:
             - name: MAIL_DATA
               value: {{ .Values.persistence.mountPath | quote }}
             {{- end }}
+            - name: MAIL_DISK_CACHE_BYTES
+              value: {{ .Values.cache.diskBytes | int64 | quote }}
             - name: SYNC_INTERVAL
               value: {{ .Values.mailbox.syncInterval | quote }}
             - name: TLS_CERT

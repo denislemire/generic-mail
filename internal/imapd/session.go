@@ -11,6 +11,7 @@ import (
 	"github.com/denislemire/generic-mail/internal/applepush"
 	"github.com/denislemire/generic-mail/internal/mailbox"
 	"github.com/denislemire/generic-mail/internal/oauth"
+	"github.com/denislemire/generic-mail/internal/state"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
@@ -229,19 +230,36 @@ func (s *session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria,
 		return nil, err
 	}
 	_ = options
+	messages := s.box.Messages(s.view)
+	var candidates map[state.ContentKey]bool
+	if query := mailbox.SearchIndexQuery(criteria); query != "" {
+		// Derived-index failure falls back to exact local scanning.
+		if found, err := s.srv.Engine.SearchCandidates(context.Background(), query); err == nil {
+			candidates = found
+		}
+	}
 	var data imap.SearchData
 	var seqSet imap.SeqSet
 	var uidSet imap.UIDSet
-	for _, msg := range s.box.Messages(s.view) {
+	for _, msg := range messages {
 		if msg.Seq == 0 {
 			continue
 		}
-		raw, err := s.srv.Engine.Body(context.Background(), msg.Loc, msg.Key)
-		if err != nil {
-			return nil, err
-		}
-		if !mailbox.Match(msg, raw, msg.Seq, criteria) {
+		matched, known := mailbox.MatchMetadata(msg, msg.Seq, criteria)
+		if known && !matched {
 			continue
+		}
+		if !known {
+			if candidates != nil && !candidates[state.ContentKey{Loc: msg.Loc, Ref: msg.Key}] {
+				continue
+			}
+			raw, err := s.srv.Engine.Body(context.Background(), msg.Loc, msg.Key)
+			if err != nil {
+				return nil, err
+			}
+			if !mailbox.Match(msg, raw, msg.Seq, criteria) {
+				continue
+			}
 		}
 		uidSet.AddNum(msg.UID)
 		var num uint32

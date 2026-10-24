@@ -55,7 +55,7 @@ func Open(path string) (*DB, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(schema + pushSchema); err != nil {
+	if _, err := db.Exec(schema + pushSchema + searchSchema); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -277,6 +277,10 @@ func (d *DB) Save(snap Snap) error {
 		if _, err = tx.Exec(`DELETE FROM pending_delete WHERE key=?`, key); err != nil {
 			return err
 		}
+	}
+	// Search is a derived projection; retire it with the last mailbox reference.
+	if _, err = tx.Exec(`DELETE FROM search_document WHERE NOT EXISTS (SELECT 1 FROM message WHERE message.loc=search_document.loc AND message.ref=search_document.ref)`); err != nil {
+		return err
 	}
 	if err = tx.Commit(); err != nil {
 		return err
