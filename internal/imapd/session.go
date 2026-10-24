@@ -229,7 +229,10 @@ func (s *session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria,
 	var data imap.SearchData
 	var seqSet imap.SeqSet
 	var uidSet imap.UIDSet
-	for _, msg := range s.box.Messages() {
+	for _, msg := range s.box.Messages(s.view) {
+		if msg.Seq == 0 {
+			continue
+		}
 		raw, err := s.srv.Engine.Body(context.Background(), msg.Loc, msg.Key)
 		if err != nil {
 			return nil, err
@@ -270,7 +273,6 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 	if options == nil {
 		options = &imap.FetchOptions{}
 	}
-	var seen []imap.UID
 	markSeen := false
 	for _, section := range options.BodySection {
 		if !section.Peek {
@@ -283,31 +285,38 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 		if fetchErr != nil {
 			return
 		}
-		raw, err := s.srv.Engine.Body(context.Background(), msg.Loc, msg.Key)
-		if err != nil {
-			fetchErr = err
+		seq := msg.Seq
+		if seq == 0 {
 			return
 		}
-		if markSeen && !s.readOnly {
-			seen = append(seen, msg.UID)
+		var raw []byte
+		if fetchNeedsBody(options) {
+			var err error
+			raw, err = s.srv.Engine.Body(context.Background(), msg.Loc, msg.Key)
+			if err != nil {
+				fetchErr = err
+				return
+			}
 		}
-		seq := msg.Seq
-		if s.view != nil {
-			if encoded := s.view.EncodeSeqNum(seq); encoded != 0 {
-				seq = encoded
+		if markSeen && !s.readOnly {
+			if err := s.box.SetSeen([]imap.UID{msg.UID}); err != nil {
+				fetchErr = err
+				return
+			}
+			found := false
+			for _, flag := range msg.Flags {
+				found = found || strings.EqualFold(string(flag), string(imap.FlagSeen))
+			}
+			if !found {
+				msg.Flags = append(msg.Flags, imap.FlagSeen)
 			}
 		}
 		mw := w.CreateMessage(seq)
-		fetchErr = writeFetch(mw, msg, raw, options)
-	})
-	if fetchErr != nil {
-		return fetchErr
-	}
-	if len(seen) > 0 {
-		s.box.SetSeen(seen)
-		return s.srv.Engine.Commit(context.Background())
-	}
-	return nil
+		responseOptions := *options
+		responseOptions.Flags = options.Flags || (markSeen && !s.readOnly)
+		fetchErr = writeFetch(mw, msg, raw, &responseOptions)
+	}, s.view)
+	return fetchErr
 }
 
 func (s *session) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *imap.StoreFlags, options *imap.StoreOptions) error {
@@ -318,26 +327,20 @@ func (s *session) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *im
 		return no("mailbox is read-only")
 	}
 	_ = options
-	changed := s.box.Store(numSet, flags.Op, flags.Flags, s.view)
-	if err := s.srv.Engine.Commit(context.Background()); err != nil {
+	changed, err := s.box.Store(numSet, flags.Op, flags.Flags, s.view)
+	if err != nil {
 		return err
 	}
 	if flags.Silent {
 		return nil
 	}
 	for _, msg := range changed {
-		raw, err := s.srv.Engine.Body(context.Background(), msg.Loc, msg.Key)
-		if err != nil {
-			return err
-		}
 		seq := msg.Seq
-		if s.view != nil {
-			if encoded := s.view.EncodeSeqNum(seq); encoded != 0 {
-				seq = encoded
-			}
+		if seq == 0 {
+			continue
 		}
 		mw := w.CreateMessage(seq)
-		if err := writeFetch(mw, msg, raw, &imap.FetchOptions{Flags: true}); err != nil {
+		if err := writeFetch(mw, msg, nil, &imap.FetchOptions{Flags: true}); err != nil {
 			return err
 		}
 	}
@@ -351,14 +354,14 @@ func (s *session) Copy(numSet imap.NumSet, dest string) (*imap.CopyData, error) 
 	if s.readOnly {
 		return nil, no("mailbox is read-only")
 	}
-	return s.box.Copy(context.Background(), numSet, dest)
+	return s.box.Copy(context.Background(), numSet, dest, s.view)
 }
 
 func (s *session) selected() error {
 	if err := s.needAuth(); err != nil {
 		return err
 	}
-	if s.box == nil {
+	if s.box == nil || !s.box.Exists() {
 		return no("select a mailbox")
 	}
 	return nil
@@ -394,7 +397,7 @@ func writeFetch(w *imapserver.FetchResponseWriter, msg mailbox.Msg, raw []byte, 
 		w.WriteInternalDate(msg.Internal)
 	}
 	if options.RFC822Size {
-		w.WriteRFC822Size(int64(len(raw)))
+		w.WriteRFC822Size(msg.Size)
 	}
 	if options.Envelope {
 		br := bufio.NewReader(bytes.NewReader(raw))
@@ -421,4 +424,9 @@ func writeFetch(w *imapserver.FetchResponseWriter, msg mailbox.Msg, raw []byte, 
 		}
 	}
 	return w.Close()
+}
+
+// Metadata operations must not depend on S3 or local body availability.
+func fetchNeedsBody(options *imap.FetchOptions) bool {
+	return options.Envelope || options.BodyStructure != nil || len(options.BodySection) > 0
 }

@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"reflect"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -32,13 +34,17 @@ type Msg struct {
 
 // Snap is a full index.
 type Snap struct {
-	Boxes []Box
-	Seen  []string
+	Boxes   []Box
+	Seen    []string
+	Deletes []string
 }
 
 // DB is the SQLite index.
 type DB struct {
-	sql *sql.DB
+	sql    *sql.DB
+	mu     sync.Mutex
+	last   Snap
+	loaded bool
 }
 
 // Open creates the schema if needed.
@@ -70,6 +76,17 @@ func (d *DB) Empty() (bool, error) {
 
 // Load reads the index.
 func (d *DB) Load() (Snap, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	snap, err := d.load()
+	if err == nil {
+		d.last = cloneSnap(snap)
+		d.loaded = true
+	}
+	return snap, err
+}
+
+func (d *DB) load() (Snap, error) {
 	var snap Snap
 	rows, err := d.sql.Query(`SELECT name, uid_validity, uid_next, subscribed FROM mailbox`)
 	if err != nil {
@@ -137,51 +154,138 @@ func (d *DB) Load() (Snap, error) {
 		}
 		snap.Seen = append(snap.Seen, key)
 	}
-	return snap, srows.Err()
+	if err := srows.Err(); err != nil {
+		return snap, err
+	}
+	drows, err := d.sql.Query(`SELECT key FROM pending_delete`)
+	if err != nil {
+		return snap, err
+	}
+	defer drows.Close()
+	for drows.Next() {
+		var key string
+		if err = drows.Scan(&key); err != nil {
+			return snap, err
+		}
+		snap.Deletes = append(snap.Deletes, key)
+	}
+	return snap, drows.Err()
 }
 
-// Save replaces the index in one transaction.
+// Save applies only changed rows, atomically. The cached snapshot advances only
+// after commit, so a failed save can be safely retried.
 func (d *DB) Save(snap Snap) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.loaded {
+		var err error
+		d.last, err = d.load()
+		if err != nil {
+			return err
+		}
+		d.loaded = true
+	}
 	tx, err := d.sql.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	for _, q := range []string{`DELETE FROM message`, `DELETE FROM mailbox`, `DELETE FROM seen`} {
-		if _, err := tx.Exec(q); err != nil {
-			return err
-		}
+	oldBoxes := map[string]Box{}
+	for _, b := range d.last.Boxes {
+		oldBoxes[b.Name] = b
 	}
 	for _, b := range snap.Boxes {
-		sub := 0
-		if b.Subscribed {
-			sub = 1
+		old, exists := oldBoxes[b.Name]
+		if !exists || old.UIDValidity != b.UIDValidity || old.UIDNext != b.UIDNext || old.Subscribed != b.Subscribed {
+			if _, err = tx.Exec(`INSERT INTO mailbox (name,uid_validity,uid_next,subscribed) VALUES (?,?,?,?)
+    ON CONFLICT(name) DO UPDATE SET uid_validity=excluded.uid_validity,uid_next=excluded.uid_next,subscribed=excluded.subscribed`, b.Name, b.UIDValidity, b.UIDNext, b.Subscribed); err != nil {
+				return err
+			}
 		}
-		if _, err := tx.Exec(
-			`INSERT INTO mailbox (name, uid_validity, uid_next, subscribed) VALUES (?, ?, ?, ?)`,
-			b.Name, b.UIDValidity, b.UIDNext, sub,
-		); err != nil {
-			return err
+		oldMessages := map[uint32]Msg{}
+		for _, m := range old.Messages {
+			oldMessages[m.UID] = m
 		}
 		for _, m := range b.Messages {
-			flags, err := json.Marshal(m.Flags)
-			if err != nil {
-				return err
+			previous, exists := oldMessages[m.UID]
+			if !exists || !reflect.DeepEqual(previous, m) {
+				flags, marshalErr := json.Marshal(m.Flags)
+				if marshalErr != nil {
+					return marshalErr
+				}
+				if _, err = tx.Exec(`INSERT INTO message (mailbox,uid,loc,ref,source_key,size,internal,flags) VALUES (?,?,?,?,?,?,?,?)
+     ON CONFLICT(mailbox,uid) DO UPDATE SET loc=excluded.loc,ref=excluded.ref,source_key=excluded.source_key,size=excluded.size,internal=excluded.internal,flags=excluded.flags`,
+					b.Name, m.UID, m.Loc, m.Ref, m.Source, m.Size, m.Internal.UTC().Format(time.RFC3339Nano), string(flags)); err != nil {
+					return err
+				}
 			}
-			if _, err := tx.Exec(
-				`INSERT INTO message (mailbox, uid, loc, ref, source_key, size, internal, flags) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-				b.Name, m.UID, m.Loc, m.Ref, m.Source, m.Size, m.Internal.UTC().Format(time.RFC3339Nano), string(flags),
-			); err != nil {
+			delete(oldMessages, m.UID)
+		}
+		for uid := range oldMessages {
+			if _, err = tx.Exec(`DELETE FROM message WHERE mailbox=? AND uid=?`, b.Name, uid); err != nil {
 				return err
 			}
 		}
+		delete(oldBoxes, b.Name)
 	}
-	for _, key := range snap.Seen {
-		if _, err := tx.Exec(`INSERT INTO seen (key) VALUES (?)`, key); err != nil {
+	for name := range oldBoxes {
+		if _, err = tx.Exec(`DELETE FROM message WHERE mailbox=?`, name); err != nil {
+			return err
+		}
+		if _, err = tx.Exec(`DELETE FROM mailbox WHERE name=?`, name); err != nil {
 			return err
 		}
 	}
-	return tx.Commit()
+	oldSeen := map[string]struct{}{}
+	for _, key := range d.last.Seen {
+		oldSeen[key] = struct{}{}
+	}
+	for _, key := range snap.Seen {
+		if _, exists := oldSeen[key]; !exists {
+			if _, err = tx.Exec(`INSERT INTO seen (key) VALUES (?)`, key); err != nil {
+				return err
+			}
+		}
+		delete(oldSeen, key)
+	}
+	for key := range oldSeen {
+		if _, err = tx.Exec(`DELETE FROM seen WHERE key=?`, key); err != nil {
+			return err
+		}
+	}
+	oldDeletes := map[string]struct{}{}
+	for _, key := range d.last.Deletes {
+		oldDeletes[key] = struct{}{}
+	}
+	for _, key := range snap.Deletes {
+		if _, exists := oldDeletes[key]; !exists {
+			if _, err = tx.Exec(`INSERT INTO pending_delete (key) VALUES (?)`, key); err != nil {
+				return err
+			}
+		}
+		delete(oldDeletes, key)
+	}
+	for key := range oldDeletes {
+		if _, err = tx.Exec(`DELETE FROM pending_delete WHERE key=?`, key); err != nil {
+			return err
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	d.last = cloneSnap(snap)
+	return nil
+}
+
+func cloneSnap(s Snap) Snap {
+	out := Snap{Boxes: append([]Box(nil), s.Boxes...), Seen: append([]string(nil), s.Seen...), Deletes: append([]string(nil), s.Deletes...)}
+	for i := range out.Boxes {
+		out.Boxes[i].Messages = append([]Msg(nil), s.Boxes[i].Messages...)
+		for j := range out.Boxes[i].Messages {
+			out.Boxes[i].Messages[j].Flags = append([]string(nil), s.Boxes[i].Messages[j].Flags...)
+		}
+	}
+	return out
 }
 
 const schema = `
@@ -201,6 +305,9 @@ CREATE TABLE IF NOT EXISTS message (
   internal TEXT NOT NULL,
   flags TEXT NOT NULL DEFAULT '[]',
   PRIMARY KEY (mailbox, uid)
+);
+CREATE TABLE IF NOT EXISTS pending_delete (
+ key TEXT PRIMARY KEY
 );
 CREATE TABLE IF NOT EXISTS seen (
   key TEXT PRIMARY KEY

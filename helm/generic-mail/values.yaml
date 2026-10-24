@@ -14,6 +14,9 @@ mailbox:
   s3Region: us-east-1
   sesRegion: ca-central-1
   syncInterval: 30s
+  # Extra envelope senders; the login address is always permitted.
+  allowedFrom: []
+  allowedFromDomains: []
 
 existingSecret: generic-mail
 
