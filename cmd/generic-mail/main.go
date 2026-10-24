@@ -77,11 +77,13 @@ func main() {
 		InsecureAuth: false,
 	})
 	submission := &smtpd.Server{
-		Hostname: hostname,
-		Username: username,
-		Password: password,
-		Sender:   sesClient,
-		OAuth:    checker,
+		Hostname:     hostname,
+		Username:     username,
+		Password:     password,
+		Sender:       sesClient,
+		OAuth:        checker,
+		AllowFrom:    strings.Split(os.Getenv("MAIL_ALLOWED_FROM"), ","),
+		AllowDomains: strings.Split(os.Getenv("MAIL_ALLOWED_FROM_DOMAINS"), ","),
 	}
 
 	errCh := make(chan error, 4)

@@ -6,7 +6,7 @@ INBOX is the inbound prefix. Those objects are never rewritten. Expunging Trash 
 
 Message bodies are cached in the process (64 MiB). The first fetch reads the bucket or the local file. Later fetches in that process do not.
 
-SMTP is AUTH PLAIN after TLS. Ports are IMAPS 993, submission 587, and SMTPS 465. The AWS SDK uses its default credential chain, including a projected service-account token when `AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE` are set.
+SMTP is AUTH PLAIN after TLS. Envelope senders default to the login address. Set comma-separated `MAIL_ALLOWED_FROM` for extra addresses or `MAIL_ALLOWED_FROM_DOMAINS` for whole domains (chart values `mailbox.allowedFrom` and `mailbox.allowedFromDomains`). To retain the previous implicit domain permission, explicitly configure `generic.business` in the domain list. Temporary delivery failures return SMTP 451 so clients can retry. Ports are IMAPS 993, submission 587, and SMTPS 465. The AWS SDK uses its default credential chain, including a projected service-account token when `AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE` are set.
 
 When `OAUTH_JWKS_URL` is set, IMAP and submission also advertise `XOAUTH2` and `OAUTHBEARER`. The initial response is the one Roundcube sends: the SASL username is an allowed identity, and `auth=` is an RS256 access token (a `Bearer ` prefix is optional). The token issuer, audience, and either `preferred_username` or `email` must match `OAUTH_ISSUER`, `OAUTH_AUDIENCE`, and `OAUTH_ALLOWED`. Password login is unchanged.
 
