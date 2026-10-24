@@ -7,6 +7,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.31.12
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.88.1
 	github.com/aws/aws-sdk-go-v2/service/sesv2 v1.49.0
+	github.com/aws/aws-sdk-go-v2/service/sqs v1.38.0
 	github.com/aws/smithy-go v1.23.0
 	github.com/emersion/go-imap/v2 v2.0.0-beta.8
 	github.com/emersion/go-message v0.18.2

@@ -15,6 +15,7 @@ import (
 	"github.com/denislemire/generic-mail/internal/applepush"
 	"github.com/denislemire/generic-mail/internal/blob"
 	"github.com/denislemire/generic-mail/internal/imapd"
+	"github.com/denislemire/generic-mail/internal/inbound"
 	"github.com/denislemire/generic-mail/internal/mailbox"
 	"github.com/denislemire/generic-mail/internal/oauth"
 	"github.com/denislemire/generic-mail/internal/sesmail"
@@ -107,6 +108,15 @@ func main() {
 	go func() { errCh <- serveHealth(engine, env("LISTEN_HEALTH", ":8080")) }()
 
 	interval := 30 * time.Second
+	if queueURL := os.Getenv("SQS_QUEUE_URL"); queueURL != "" {
+		consumer, err := inbound.New(ctx, queueURL, env("SQS_REGION", s3Region), bucket, prefix, engine)
+		if err != nil {
+			log.Fatalf("inbound queue configuration: %v", err)
+		}
+		go consumer.Run(ctx)
+		interval = 5 * time.Minute
+		log.Printf("S3 inbound notifications enabled")
+	}
 	if v := os.Getenv("SYNC_INTERVAL"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil || d <= 0 {
